@@ -7,16 +7,11 @@ from csv import Sniffer
 from re import findall
 from matplotlib.pyplot import savefig, subplots, close
 from datetime import datetime
-from scipy.ndimage import gaussian_filter1d
-from scipy.signal import savgol_filter
-from scipy.signal import find_peaks
 import torch
 import select_columns
 import fit_animation
 import create_azimuths
-from optimize_v2 import run_optimization
 from helper_funs import plot_disp_graph
-from pylib_general import gaussian_convolution_nonuniform
 from maps_functions import generate_google_maps_html, generate_leaflet_html
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
@@ -1227,54 +1222,68 @@ class MainWindow(QWidget):
 
         return jobs
 
+    # def read_h5(self, folder, num_files):
+    #     jobs = []
+    #     curr_file_i = 1
+    #     while curr_file_i < num_files:
+    #         f_path = folder[curr_file_i-1]
+
+    #         f = h5py.File(f_path, 'r')
+    #         keys = list(f.keys())
+
+    #         file_name, _ = self.get_path_name(f_path)
+    #         init_p = None
+
+    #         #if dim == 2 then len(keys) needs to be 2. each group then has to have profiles as subgroups
+            
+    #         #for i in range(len(keys)):
+    #         for i in range(1):
+    #             key = keys[i]
+    #             print("KEY ", key, int(key[key.rfind("_") + 1:]))
+    #             ds = f[keys[500]]
+    #             coords = self.process_locations(None, i) if self.loc_format else None
+    #             jobs.append({'df': np.array(ds),
+    #                         'file_num': int(key[key.rfind("_") + 1:]), # profile_id format: profile_num
+    #                         'coords': coords, 
+    #                         'file_key': file_name,
+    #                         'file_info': (f_path, i)})
+            
+    #         curr_file_i += 1
+
+    #     return jobs
+
     def read_h5(self, folder, num_files):
         jobs = []
         curr_file_i = 1
         while curr_file_i < num_files:
             f_path = folder[curr_file_i-1]
-            #print(f_path, type(f_path))
-
             f = h5py.File(f_path, 'r')
-            keys = list(f.keys())
+            file_keys = list(f.keys())
 
+            groups = [f[k] for k in file_keys]
+            prof_keys = list(groups[0].keys())
+            
             file_name, _ = self.get_path_name(f_path)
             init_p = None
 
-            #if dim == 2 then len(keys) needs to be 2. each group then has to have profiles as subgroups
-            
             #for i in range(len(keys)):
             for i in range(1):
-                key = keys[i]
+                key = prof_keys[401]
                 print("KEY ", key, int(key[key.rfind("_") + 1:]))
-                ds = f[keys[500]]
+                ds1 = np.array(groups[0][key])
+                ds2 = np.array(groups[1][key]) if len(groups) == 2 else None
+
                 coords = self.process_locations(None, i) if self.loc_format else None
-                jobs.append({'df': np.array(ds),
-                            'file_num': int(key[key.rfind("_") + 1:]), # profile_id format: profile_num
-                            'coords': coords, 
-                            'file_key': file_name,
-                            'file_info': (f_path, i)})
+                jobs.append({'df1': ds1,
+                             'df2': ds2,
+                             'file_num': int(key[key.rfind("_") + 1:]), # profile_id format: profile_num
+                             'coords': coords, 
+                             'file_key': file_name,
+                             'file_info': (f_path, i)})
             
             curr_file_i += 1
 
         return jobs
-
-    # def process_peaks(jobs):
-    #     def h5(ds1):
-    #         ds1 = ds1[:,np.any(~np.isnan(ds1), axis=0)]
-    #         y1 = np.nanmean(ds1, axis=0)
-
-    #         #smooth_y1 = gaussian_convolution_nonuniform(x, y1, sigma_x=20)
-    #         #smooth_data = np.array([x, smooth_y1]).T
-
-
-
-    #         return smooth_data
-
-    #     prev_prof_data = h5(jobs[0]['df'])
-    #     curr_prof_data = h5(jobs[1]['df'])
-        
-    #     for i in range(1, len(jobs)-1):
-    #         next_prof_data = h5(jobs[i+1]['df'])
 
 
     def show_file_selector(self):

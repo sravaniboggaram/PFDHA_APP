@@ -19,6 +19,7 @@ import pathlib
 
 
 def gen_params_and_bounds2(data_loc, data_disp, peak_locs, rand=False):
+    # data_loc is the normalized 0-1 x range
     n_rup = len(peak_locs) if len(peak_locs) > 0 else 1
 
     n_pt, n_dim = data_disp.shape
@@ -71,7 +72,8 @@ def gen_params_and_bounds2(data_loc, data_disp, peak_locs, rand=False):
 
     c0_lb = min(d_par_min,d_nor_min)
     s_lb = 0.1
-    d_lb = 0.2*max(d_par_width,d_nor_width)
+    #d_lb = 0.2*max(d_par_width,d_nor_width)
+    d_lb = 1e-6
     a_lb = 15.
     ramp_lb = -30
     slope_lb = -30
@@ -83,12 +85,10 @@ def gen_params_and_bounds2(data_loc, data_disp, peak_locs, rand=False):
     ramp_ub = 30
     slope_ub = 30
 
-    d_fact = 0.5
+    d_fact = 0.2
 
     rand = int(rand)
     r1, r2 = 1-rand, rand
-    
-    n_rup = 1
 
     res = {}
     #res["loc"]    = [r1*i*(s_end-s_str)/(n_rup+1) + r2*uniform(s_str, s_end) for i in range(1, n_rup+1)]
@@ -126,118 +126,6 @@ def gen_params_and_bounds2(data_loc, data_disp, peak_locs, rand=False):
     }
 
     return res, param_bounds
-
-
-
-def custom_grad(data_disp):
-    grad = np.zeros(len(data_disp))
-    
-    for i in range(10,len(data_disp)):
-        grad[i] = (data_disp[i]-data_disp[i-10])/10
-    
-    return grad
-
-
-def get_num_rups(data_disp, sigma):
-    return None, [], None
-
-    # smooth_y = gaussian_filter1d(data_disp, sigma=10)
-    # N = int(0.1*len(smooth_y))
-    # grad1 = custom_grad(smooth_y) 
-
-    # smooth_grad = gaussian_filter1d(grad1, sigma=32)
-    # peaks1, _ = find_peaks(smooth_grad, prominence=0.15*max(grad1))
-    # #peaks1, _ = find_peaks(smooth_grad)
-
-    # peaks2 = None
-
-    # fig, ax = plt.subplots(figsize=(8,16),nrows=3)
-
-    # ax[0].plot(grad1, "-")
-    # ax[0].plot(peaks1, grad1[peaks1], "x")
-    # ax[0].set_title("first dim")
-
-    # ax[1].plot(smooth_grad)
-
-    # ax[2].plot(smooth_y)
-    # fig.savefig('peaks.png')
-
-    # if len(peaks1) == 1:
-    #     return grad1, peaks1, peaks2
-    
-    # widths = peak_widths(smooth_grad, peaks1)[0]
-
-    # for p in range(len(peaks1)):
-    #     half_width = int(widths[p]/2)
-    #     start = max(0, half_width - N)
-    #     end = min(10*N, half_width + N)
-
-    #     rupture_candidate = smooth_y[start:end]
-
-
-
-
-
-    # peak_vals = grad1[peaks1]
-    # max_peak_ind = np.argmax(peak_vals)
-
-    # test_peaks = [max_peak_ind]
-    # if max_peak_ind != 0:
-    #     test_peaks.append(max_peak_ind - 1)
-    # if max_peak_ind != len(peaks1):
-    #     test_peaks.append(max_peak_ind + 1)
-
-    # widths = peak_widths(smooth_grad, peaks1[test_peaks])[0]
-    # print("INDICES")
-    # print("P ", peaks1[max_peak_ind])
-    # print("R ", peaks1[max_peak_ind]+np.round(widths[0]/2))
-    # main_peak_disp = smooth_y[peaks1[max_peak_ind]+int(widths[0]/2)] - smooth_y[peaks1[max_peak_ind]-int(widths[0]/2)]
-    # for i in range(1, len(test_peaks)):
-    #     ind = test_peaks[i]
-    #     disp = smooth_y[peaks1[ind]+int(widths[i]/2)] - smooth_y[peaks1[ind]-int(widths[i]/2)]
-    #     if disp < 0.25*main_peak_disp:
-    #         test_peaks[i] = None
-
-    # test_peaks = [peak for peak in test_peaks if peak is not None]
-    
-    # return smooth_grad, test_peaks, peaks2
-    # sigmas = [1,3,5,9,15]
-
-    # w = max(int(0.2*len(data_disp)), 5)
-    # if w %2 == 0:
-    #     w += 1
-    # smooth = savgol_filter(grad1, window_length=w, polyorder=3)
-    #grad1 = custom_grad(smooth)
-    # all_peaks = []
-    # for s in sigmas:
-    #     smooth = gaussian_filter1d(grad1, sigma=s)
-    #     peaks, _ = find_peaks(smooth, prominence=0.8*max(grad1))
-    #     all_peaks.append(peaks)
-
-    # peaks1 = []
-    # for p in range(len(all_peaks) - 1):
-    #     common = set(all_peaks[p]).intersection(all_peaks[p+1])
-    #     peaks1.extend(list(common))
-
-#     widths = peak_widths(grad1, peaks1)
-#     main_peak_height = 0
-#     main_peak_width = 0
-#     for p in range(len(peaks1)):
-#         if grad1[peaks1[p]] > main_peak_height:
-#             main_peak_height = grad1[peaks1[p]]
-#             main_peak_width = widths[0][p]
-
-
-#     temp = []
-#     for i in range(len(peaks1)):
-#         if grad1[peaks1[i]] > 0.2*main_peak_height and widths[0][i] < 2*main_peak_width:
-#             temp.append(peaks1[i])
-#     peaks1 = temp
-
-    # if len(peaks1) >= 2:
-    #     peaks2, _ = find_peaks(grad1, prominence=0.5*max(grad1))
-
-    return grad1, peaks1, peaks2
 
 
 def prof_normalization(data):
@@ -369,7 +257,7 @@ def calc_uncertainties(seg1, seg2, loc, wind_bounds=None, n_iter=1000):
 
 def post_process_params(data_obj, model, coords):
     scale, shift = data_obj.scale_shift
-    norm_vals = model(torch.tensor(data_obj.x, dtype=torch.float64).unsqueeze(0).T)
+    norm_vals = model(torch.tensor(data_obj.x, dtype=torch.float32).unsqueeze(0).T)
 
     col_names = ["Profile ID", "Dimension", "Rupture", "origin", "rescaled origin", "loc",
                  "rescaled loc", "width", "rescaled width", "actual width", "ramp", 
@@ -467,7 +355,7 @@ def post_process_params(data_obj, model, coords):
 
 def post_process_params_v4(data_obj, model, coords):
     scale, shift = data_obj.scale_shift
-    norm_vals = model(torch.tensor(data_obj.x, dtype=torch.float64).unsqueeze(0).T)
+    norm_vals = model(torch.tensor(data_obj.x, dtype=torch.float32).unsqueeze(0).T)
 
     col_names = ["Profile ID", "Dimension", "Rupture", "origin", "rescaled origin", "loc",
                  "rescaled loc", "width", "rescaled width", "actual width", "ramp", 
@@ -499,19 +387,20 @@ def post_process_params_v4(data_obj, model, coords):
         'slope': lambda v: v * data_obj.flip * scale,
     }
 
-
+    model.rescaled = True
     for full_name, p in model.named_parameters():
 
         ind = full_name.rfind(".") + 1
         name = full_name[ind:]
 
         p_lb, p_ub = data_obj.param_bounds[name]
-        val = p_lb + (p_ub - p_lb)*torch.sigmoid(p)  #actual normalized param value
+        real_norm_val = (p_lb + (p_ub - p_lb)*torch.sigmoid(p)).item()  #actual normalized param value
+        real_rescaled_val = rescale[name](real_norm_val)
 
         if name == "ramp":
-            ramp_p = val.item()
+            ramp_p = real_norm_val
 
-        org_params[name].append(val.item())
+        org_params[name].append(real_norm_val)
         
         loc_encountered = False
         first_row = None
@@ -527,42 +416,29 @@ def post_process_params_v4(data_obj, model, coords):
         else:
             # populate first row of params that are the same across dims or rups
             rows = df.index[df["Dimension"] == d_num].to_list() if d_num else df.index[df["Rupture"] == r_num].to_list()
-            row = rows[0]
-            df.at[row, name] = val.item()
-            df.at[row, "rescaled "+name] = rescale[name](val.item())
+            first_row = rows[0]
+            df.at[first_row, name] = real_norm_val
+            df.at[first_row, "rescaled "+name] = real_rescaled_val
 
             with torch.no_grad():
-                rescaled = rescale[name](val.item()) #actual rescaled param value
-                resc_p_lb = rescale[name](p_lb)
-                resc_p_ub = rescale[name](p_ub)
-                # rescaled_shift = (rescaled - p_lb) / (p_ub - p_lb)
-                rescaled_shift = (rescaled - resc_p_lb) / (resc_p_ub - resc_p_lb)
-                rescaled_shift = torch.clamp(torch.tensor(rescaled_shift, dtype=torch.float64), 1e-8, 1 - 1e-8)
-                rescaled_raw = torch.log(rescaled_shift / (1-rescaled_shift))
-                p.copy_(rescaled_raw.reshape_as(p))
+                p.copy_(torch.tensor(real_rescaled_val, dtype=torch.float64).reshape_as(p))
 
-            first_row = row
             rows = rows[1:]
-        
-        for row in rows:
 
+        for row in rows:
             df.at[row, "Profile ID"] = data_obj.prof_id
             if name == "disp" or name == "slope":
-                df.at[row, name] = val.item()
-                df.at[row, "rescaled "+name] = rescale[name](val.item())
+                df.at[row, name] = real_norm_val
+                df.at[row, "rescaled " + name] = real_rescaled_val
                 with torch.no_grad():
-                    rescaled = rescale[name](val.item())
-                    rescaled_shift = (rescaled - p_lb) / (p_ub - p_lb)
-                    rescaled_shift = torch.clamp(torch.tensor(rescaled_shift, dtype=torch.float64), 1e-8, 1 - 1e-8)
-                    rescaled_raw = torch.log((rescaled_shift / (1-rescaled_shift)))
-                    p.copy_(rescaled_raw.reshape_as(p))
+                    p.copy_(torch.tensor(real_rescaled_val, dtype=torch.float64).reshape_as(p))
                 continue
 
             df.at[row, name] = df.at[first_row, name]
             df.at[row, "rescaled "+name] = df.at[first_row, "rescaled "+name]
         
             if name == 'loc' and not loc_encountered and coords != None:
-                new_coords = convert_location(val.item(), coords)['LATLON']
+                new_coords = convert_location(real_norm_val, coords)['LATLON']
                 df.at[row, "latitude"] = new_coords[0]
                 df.at[row, "longitude"] = new_coords[1]
                 df.at[row, "old lat"] = coords[0]
@@ -570,7 +446,7 @@ def post_process_params_v4(data_obj, model, coords):
                 loc_encountered = True
 
 
-    scaled_vals = model(torch.tensor((data_obj.x/scale)+shift, dtype=float).unsqueeze(0).T)
+    scaled_vals = model(torch.tensor((data_obj.x/scale)+shift, dtype=torch.float32).unsqueeze(0).T)
 
     lin_seg, curve_seg, act_widths = split_profile(df["rescaled loc"], df['rescaled width'], scale=1)
 
@@ -703,13 +579,12 @@ def split_profile(locs, width_factors, scale=1):
     for w in range(len(width_factors)):
         widths[w] = sigmoid_width([0.02, 0.98], locs[w], width_factors[w])
 
+
     curr_ind = 0
     linear_segments = []
     sigmoid_segments = []
     for i in range(len(locs)):
-        #linear_segments.append(data_loc[curr_ind:round(locs[i]-widths[i]/2)])
         linear_segments.append((curr_ind,round((locs[i]-widths[i]/2)/scale)))
-        #sigmoid_segments.append(data_loc[round(locs[i]-widths[i]/2):round(locs[i]+widths[i]/2)])
         sigmoid_segments.append((round((locs[i]-widths[i]/2)/scale),round((locs[i]+widths[i]/2)/scale)))
         curr_ind = round((locs[i]+widths[i]/2)/scale)
     linear_segments.append((curr_ind, -1))

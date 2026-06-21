@@ -3,6 +3,7 @@ from torch import nn
 from torch import Tensor
 from torch.nn import functional
 from fit_animation import FitHistoryWidget
+from scipy.stats import linregress
 from helper_funs import *
 
 
@@ -16,22 +17,25 @@ class LayerBase1Dim(nn.Module):
         self.ramp, self.ramp_bounds = seed_ramp
 
         transf_orig = (self.origin - self.origin_bounds[0]) / (self.origin_bounds[1] - self.origin_bounds[0])
-        transf_orig = torch.clamp(torch.tensor(transf_orig, dtype=torch.float64), 1e-8, 1 - 1e-8)
+        transf_orig = torch.clamp(torch.tensor(transf_orig, dtype=torch.float32), 1e-8, 1 - 1e-8)
         transf_orig = torch.log(transf_orig / (1-transf_orig))
 
         transf_ramp = (self.ramp - self.ramp_bounds[0]) / (self.ramp_bounds[1] - self.ramp_bounds[0])
-        transf_ramp = torch.clamp(torch.tensor(transf_ramp, dtype=torch.float64), 1e-8, 1 - 1e-8)
+        transf_ramp = torch.clamp(torch.tensor(transf_ramp, dtype=torch.float32), 1e-8, 1 - 1e-8)
         transf_ramp = torch.log(transf_ramp / (1-transf_ramp))
 
         #optimizable parameters
-        self.ramp   = nn.Parameter(torch.tensor([[transf_ramp]], dtype=torch.float64), requires_grad=True) #slope of base profile
-        self.origin = nn.Parameter(torch.tensor([transf_orig], dtype=torch.float64), requires_grad=True) #displacment at origin
+        self.ramp   = nn.Parameter(torch.tensor([[transf_ramp]], dtype=torch.float32), requires_grad=True) #slope of base profile
+        self.origin = nn.Parameter(torch.tensor([transf_orig], dtype=torch.float32), requires_grad=True) #displacment at origin
 
-    def forward(self, s:Tensor) -> Tensor:
+    def forward(self, s:Tensor, rescaled: bool) -> Tensor:
         '''Compute displacement of base profile (origin and slope)'''
-
-        ramp = self.ramp_bounds[0] + (self.ramp_bounds[1] - self.ramp_bounds[0])*torch.sigmoid(self.ramp)
-        origin = self.origin_bounds[0] + (self.origin_bounds[1] - self.origin_bounds[0])*torch.sigmoid(self.origin)
+        if rescaled:
+            ramp = self.ramp
+            origin = self.origin
+        else:
+            ramp = self.ramp_bounds[0] + (self.ramp_bounds[1] - self.ramp_bounds[0])*torch.sigmoid(self.ramp)
+            origin = self.origin_bounds[0] + (self.origin_bounds[1] - self.origin_bounds[0])*torch.sigmoid(self.origin)
 
         #transform profile axis
         d = functional.linear(s, ramp, origin)
@@ -48,24 +52,28 @@ class LayerSingleRup1Dim(nn.Module):
         #self.width = seed_width
 
         transf_disp = (self.disp - self.disp_bounds[0]) / (self.disp_bounds[1] - self.disp_bounds[0])
-        transf_disp = torch.clamp(torch.tensor(transf_disp, dtype=torch.float64), 1e-8, 1 - 1e-8)
+        transf_disp = torch.clamp(torch.tensor(transf_disp, dtype=torch.float32), 1e-8, 1 - 1e-8)
         transf_disp = torch.log(transf_disp / (1-transf_disp))
 
         transf_slope = (self.slope - self.slope_bounds[0]) / (self.slope_bounds[1] - self.slope_bounds[0])
-        transf_slope = torch.clamp(torch.tensor(transf_slope, dtype=torch.float64), 1e-8, 1 - 1e-8)
+        transf_slope = torch.clamp(torch.tensor(transf_slope, dtype=torch.float32), 1e-8, 1 - 1e-8)
         transf_slope = torch.log(transf_slope / (1-transf_slope))
 
         #optimizable parameters
-        self.disp  = nn.Parameter(torch.tensor([transf_disp], dtype=torch.float64), requires_grad=True)  #displacement
-        self.slope = nn.Parameter(torch.tensor([transf_slope], dtype=torch.float64), requires_grad=True) #slope
+        self.disp  = nn.Parameter(torch.tensor([transf_disp], dtype=torch.float32), requires_grad=True)  #displacement
+        self.slope = nn.Parameter(torch.tensor([transf_slope], dtype=torch.float32), requires_grad=True) #slope
         
     #def forward(self, s_sig:Tensor, s_hinge: Tensor) -> Tensor:
-    def forward(self, s: Tensor) -> Tensor:
+    def forward(self, s: Tensor, rescaled: bool) -> Tensor:
         '''Compute displacement from single rupture 
            (zero displacement at origin, rupture location at s=0)'''
 
-        disp = self.disp_bounds[0] + (self.disp_bounds[1] - self.disp_bounds[0])*torch.sigmoid(self.disp)
-        slope = self.slope_bounds[0] + (self.slope_bounds[1] - self.slope_bounds[0])*torch.sigmoid(self.slope)
+        if rescaled:
+            disp = self.disp
+            slope = self.slope
+        else:
+            disp = self.disp_bounds[0] + (self.disp_bounds[1] - self.disp_bounds[0])*torch.sigmoid(self.disp)
+            slope = self.slope_bounds[0] + (self.slope_bounds[1] - self.slope_bounds[0])*torch.sigmoid(self.slope)
 
         d = disp * functional.sigmoid(s) + slope * functional.softplus(s)   #no scale
         #d = disp * functional.sigmoid(s_sig) + slope * functional.softplus(s_hinge) # scale with width as par
@@ -92,15 +100,15 @@ class LayerSingleRupMDim(nn.Module):
         self.width, self.width_bounds = seed_width
 
         transf_loc = (self.loc - self.loc_bounds[0]) / (self.loc_bounds[1] - self.loc_bounds[0])
-        transf_loc = torch.clamp(torch.tensor(transf_loc, dtype=torch.float64), 1e-8, 1 - 1e-8)
+        transf_loc = torch.clamp(torch.tensor(transf_loc, dtype=torch.float32), 1e-8, 1 - 1e-8)
         transf_loc = torch.log(transf_loc / (1-transf_loc))
 
         transf_width = (self.width - self.width_bounds[0]) / (self.width_bounds[1] - self.width_bounds[0])
-        transf_width = torch.clamp(torch.tensor(transf_width, dtype=torch.float64), 1e-8, 1 - 1e-8)
+        transf_width = torch.clamp(torch.tensor(transf_width, dtype=torch.float32), 1e-8, 1 - 1e-8)
         transf_width = torch.log(transf_width / (1-transf_width))
 
-        self.loc   = nn.Parameter(torch.tensor([transf_loc], dtype=torch.float64), requires_grad=True)     #rupture location
-        self.width = nn.Parameter(torch.tensor([[transf_width]], dtype=torch.float64), requires_grad=True) #rupture width
+        self.loc   = nn.Parameter(torch.tensor([transf_loc], dtype=torch.float32), requires_grad=True)     #rupture location
+        self.width = nn.Parameter(torch.tensor([[transf_width]], dtype=torch.float32), requires_grad=True) #rupture width
 
         #building block layers
         self.prof = nn.ModuleDict([[self.key_dim(j), LayerSingleRup1Dim((seed_disp[j], disp_bounds), (seed_slope[j], slope_bounds))] 
@@ -110,12 +118,16 @@ class LayerSingleRupMDim(nn.Module):
         
         return 'd%i'%j
     
-    def forward(self, s:Tensor) -> Tensor:
+    def forward(self, s:Tensor, rescaled: bool) -> Tensor:
         '''Compute displacement from single rupture, multiple dimensions
            (zero displacement at origin, rupture location from linear layer)'''
         
-        loc = self.loc_bounds[0] + (self.loc_bounds[1] - self.loc_bounds[0])*torch.sigmoid(self.loc)
-        width = self.width_bounds[0] + (self.width_bounds[1] - self.width_bounds[0])*torch.sigmoid(self.width)
+        if rescaled:
+            loc = self.loc
+            width = self.width
+        else:
+            loc = self.loc_bounds[0] + (self.loc_bounds[1] - self.loc_bounds[0])*torch.sigmoid(self.loc)
+            width = self.width_bounds[0] + (self.width_bounds[1] - self.width_bounds[0])*torch.sigmoid(self.width)
         
         #transform profile axis
         s = functional.linear(s, width, -loc*width)
@@ -125,8 +137,7 @@ class LayerSingleRupMDim(nn.Module):
         
         #compute displacement multiple dimenstions
         #d = torch.cat([self.prof[self.key_dim(j)](s_sig, s_hinge) for j in range(self.ndim)], dim=1)
-        d = torch.cat([self.prof[self.key_dim(j)](s) for j in range(self.ndim)], dim=1)
-
+        d = torch.cat([self.prof[self.key_dim(j)](s, rescaled) for j in range(self.ndim)], dim=1)
 
         return d
 
@@ -137,7 +148,8 @@ class SlipProfileNN(nn.Module):
                  seed_origin = None, seed_ramp = None, 
                  seed_loc = None, seed_width = None,
                  seed_disp = None, seed_slope = None,
-                 bounds = None) -> None:
+                 bounds = None,
+                 rescaled=False) -> None:
         super().__init__()
 
         self.bounds = bounds
@@ -153,6 +165,8 @@ class SlipProfileNN(nn.Module):
         #fixed parameters
         self.nrup = nrup #number of ruptures
         self.ndim = ndim #number of dimensions
+
+        self.rescaled = rescaled
 
         #building block layers
         self.prof = nn.ModuleDict([[self.key_rup(l), LayerSingleRupMDim(ndim, (seed_loc[l],bounds['loc']), (seed_width[l], bounds['width']), 
@@ -173,11 +187,11 @@ class SlipProfileNN(nn.Module):
     def forward(self, s:Tensor) -> Tensor:
         '''Compute displacement from multiple ruptres'''
         #base profile (origin and linear slope)
-        d = torch.cat([self.base[self.key_dim(j)](s) for j in range(self.ndim)], dim=1)
+        d = torch.cat([self.base[self.key_dim(j)](s, self.rescaled) for j in range(self.ndim)], dim=1)
 
         #add displacement of each rupture
         for l in range(self.nrup):
-            d += self.prof[self.key_rup(l)](s)
+            d += self.prof[self.key_rup(l)](s, self.rescaled)
         
         return d
     
@@ -237,12 +251,25 @@ def penalty_loss_old(y_pred, y_act, locs=[1], lam=10):
 
 
 def loc_loss(y_pred, y_act, loc_params):
-    loc_penalty = torch.tensor(1, dtype=torch.float64)
-    for i in range(len(loc_params)):
-        loc_penalty = torch.add(loc_penalty, (loc_params[i] - loc_params[i-1]), alpha=1.5)
-    
-    return rmse(y_pred, y_act) + loc_penalty
+    if len(loc_params) == 1:
+        return torch.nn.MSELoss()(y_pred, y_act)
 
+    loc_penalty = torch.tensor(1, dtype=torch.float32)
+    for i in range(1, len(loc_params)):
+        loc_penalty = torch.add(loc_penalty,
+                                (loc_params[i] - loc_params[i-1]) - torch.tensor(0.1, dtype=torch.float32),
+                                alpha=3)
+    
+    return torch.subtract(torch.nn.MSELoss()(y_pred, y_act), loc_penalty)
+
+def param_act_to_transf(param, bounds):
+    transf_p = (param - bounds[0]) / (bounds[1] - bounds[0])
+    transf_p = np.clip(transf_p, 1e-8, 1-1e-8)
+    return np.log(transf_p/(1-transf_p))
+    # return torch.log(torch.tensor(transf_p / (1-transf_p)), dtype=torch.float32)
+
+def param_transf_to_act(param, bounds):
+    return bounds[0] + (bounds[1] - bounds[0])/(1+np.exp(-param))
 
 def NN_optimize(data, collect_param_vals=False):
     model = SlipProfileNN(ndim=data.n_dim, nrup=data.n_rup,
@@ -259,7 +286,7 @@ def NN_optimize(data, collect_param_vals=False):
     x, y = data.x, data.y
     scale = data.scale_shift[0]
     learn_rate, n_epoch = data.lr, data.n_epochs
-    x_tensor = torch.tensor(x, dtype=torch.float64).unsqueeze(0).T
+    x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0).T
     
     width_p = []
     loc_p = []
@@ -276,23 +303,24 @@ def NN_optimize(data, collect_param_vals=False):
                 loc_p.append(param)
             non_width_p.append(param)
  
-    # opt_params = [
-    #     {'params': width_p, 'lr':0.01},
-    #     {'params': non_width_p, 'lr': 1e-3}
-    # ]
+    opt_params = [
+        {'params': width_p, 'lr':0.01},
+        {'params': non_width_p, 'lr': 1e-3}
+    ]
 
     opt = torch.optim.Adam(model.parameters())
+    #opt = torch.optim.Adam(opt_params)
     loss_fn = torch.nn.MSELoss()
     #loss_fn = loc_loss
 
-    y_b = torch.tensor(y, dtype=torch.float64)
+    y_b = torch.tensor(y, dtype=torch.float32)
     y_pred = model(x_tensor)
     if data.n_dim > 1:
         y_b = torch.concat((y_b[:,0], y_b[:,1]))
         y_pred = torch.concat((y_pred[:,0], y_pred[:,1]))
 
+    #prev_loss = loss_fn(y_pred, y_b).item()
     prev_loss = loss_fn(y_pred, y_b).item()
-    #prev_loss = loss_fn(y_pred, y_b, loc_p).item()
     losses['total_loss'].append(prev_loss)
     total_n_epochs = 0
         
@@ -316,7 +344,7 @@ def NN_optimize(data, collect_param_vals=False):
             if data.n_dim > 1:
                 y_pred = torch.concat((y_pred[:,0], y_pred[:,1]))
                     
-            loss = loss_fn(y_pred, y_b, loc_p, width_p, scale) if lf == "R" else loss_fn(y_pred, y_b)
+            loss = loss_fn(y_pred, y_b) if lf == "L1" else loss_fn(y_pred, y_b)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -340,28 +368,53 @@ def NN_optimize(data, collect_param_vals=False):
         #total_n_epochs += iter_n
 
     l = training_loop(0.99, 20000, ["all_true"], prev_loss)
-    prev_loss = l['L1']
+    prev_loss = l['mse']
 
     loss_fn = torch.nn.L1Loss()
-    l = training_loop(0.999, 5000, ["loc", "width"], prev_loss, lr=1e-4)
+    l = training_loop(0.999, 4000, ["loc", "width"], prev_loss, lr=1e-4, lf="L1")
     prev_loss = l['mse']
 
     loss_fn = torch.nn.MSELoss()
-    training_loop(0.9999, 3000, ["ramp", "slope", "origin", "disp"], prev_loss, lr=1e-4)
+    training_loop(0.9999, 3000, ["ramp", "slope", "origin", "disp"], prev_loss, lr=1e-4,lf="L1")
 
-    for name, p in model.named_parameters():
-        var_name = name[name.rfind(".")+1:]
-        low, high = data.param_bounds[var_name]
-        sig = torch.sigmoid(p).item()
-        bounded = low + (high - low) * torch.sigmoid(p)
+    # fig, ax = plt.subplots(nrows=2, ncols=1)
+    # ax[0].plot(x, y)
+    # ax[0].plot(x, model(x_tensor).detach().numpy())
 
-        print("NAME:", name)
-        print("VAR :", var_name)
-        print("RAW :", p.item())
-        print("BND :", low, high)
-        print("SIG :", sig)
-        print("OUT :", bounded.item())
-        print()
+    # lin_seg, _, _ = split_profile([param_transf_to_act(l.item(), data.param_bounds['loc']) for l in loc_p],
+    #                               [param_transf_to_act(w.item(), data.param_bounds['width']) for w in width_p],
+    #                               scale)
+    # ax[0].axvline(x=lin_seg[0][1])
+    # ax[0].axvline(x=lin_seg[1][0])
+    # plt.show()
+
+    # for name, p in model.named_parameters():
+    #     #print(name, p)
+    #     if "d0.ramp" in name:
+    #         ramp = stats.linregress(x[lin_seg[0][0]:lin_seg[0][1]].flatten(), y[:,0][lin_seg[0][0]:lin_seg[0][1]].flatten())
+    #         ramp_slope, _ = ramp.slope, ramp.intercept
+    #         p.data *= 0
+    #         p.data += torch.tensor(param_act_to_transf(ramp_slope, data.param_bounds['ramp']), dtype=torch.float32)
+    #     elif "d1.ramp" in name:
+    #         ramp = stats.linregress(x[lin_seg[0][0]:lin_seg[0][1]].flatten(), y[:,1][lin_seg[0][0]:lin_seg[0][1]].flatten())
+    #         ramp_slope, _ = ramp.slope, ramp.intercept
+    #         p.data *= 0
+    #         p.data += torch.tensor(ramp_slope, dtype=torch.float32)
+
+    # l = training_loop(0.9999, 5000, ["disp"], prev_loss, lr=1e-4)
+    
+    # for name, p in model.named_parameters():
+    #     var_name = name[name.rfind(".")+1:]
+    #     low, high = data.param_bounds[var_name]
+    #     sig = torch.sigmoid(p).item()
+    #     bounded = low + (high - low) * torch.sigmoid(p)
+
+    #     print("NAME:", name)
+    #     print("VAR :", var_name)
+    #     print("RAW :", p.item())
+    #     print("BND :", low, high)
+    #     print("SIG :", sig)
+    #     print("OUT :", bounded.item())
 
     print("OPTIMIZER LOSS: ", losses['total_loss'][-1])
 

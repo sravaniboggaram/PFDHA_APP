@@ -1,7 +1,6 @@
 from pylib_general import gaussian_convolution_nonuniform
 import numpy as np
-import pandas as pd
-from optimize_v2 import run_optimization
+from optimize_v3 import run_optimization
 from PyQt5 import QtCore
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 from multiprocessing import get_context
@@ -11,38 +10,89 @@ import os
 import traceback
 import matplotlib
 from matplotlib.pyplot import close
-from scipy.stats import linregress
 import csv
 
 matplotlib.use("Agg")
+
+# def process_h5_data(job, config, fig_dir, history=False, progress_cb=None):
+#     coords = job['coords']
+#     file_num = job['file_num']
+#     file_name = job['file_key']
+#     ds1 = job['df']
+#     ds1 = ds1[:,np.any(~np.isnan(ds1), axis=0)]
+
+#     y1 = np.nanmean(ds1, axis=0)
+#     n_points = len(y1)
+#     # start, end = round(0.15*len(y1)), round(0.8*len(y1))
+#     # y1 = y1[start:end]
+
+#     #FIX!!!!!!!!
+#     sigma_x = {}
+#     x = np.arange(n_points)
+
+#     if n_points < 450:
+#         x_interp = np.linspace(0, n_points, 1000)
+#         y_interp = np.interp(x_interp, x, y1)
+#         data = np.array([x_interp, y_interp]).T
+
+#         x,y1 = x_interp, y_interp
+#     else:
+#         data = np.array([x, y1]).T
+        
+#     smooth_y1 = gaussian_convolution_nonuniform(x, y1, sigma_x=20)
+#     smooth_data = np.array([x, smooth_y1]).T
+
+#     table, fig, model, u, losses, init_p = run_optimization(smooth_data, 
+#                                                             data, 
+#                                                             file_num, 
+#                                                             config.sigma, 
+#                                                             config.rand, 
+#                                                             config.uncert, 
+#                                                             coords, 
+#                                                             config.w_bounds)
+#     #self.init_p = init_p if self.prev_ip else None
+
+
+#     if config.save_loc:
+#         fig_path = os.path.join(fig_dir, f"{file_name}_profile{file_num}.png")
+#         fig.savefig(fig_path)
+#         close(fig)
+
+#     return {'file_key': job['file_key'], 'file_num': file_num,
+#                 'res': {'table': table, 'fig': fig, 'losses': losses, 
+#                         'init_p': init_p, 'uncert': u, 'file_info': job['file_info']}}
+
 
 def process_h5_data(job, config, fig_dir, history=False, progress_cb=None):
     coords = job['coords']
     file_num = job['file_num']
     file_name = job['file_key']
-    ds1 = job['df']
-    ds1 = ds1[:,np.any(~np.isnan(ds1), axis=0)]
+    ds1 = job['df1']
+    ds2 = job['df2']
+    ys = []
 
-    y1 = np.nanmean(ds1, axis=0)
-    n_points = len(y1)
-    # start, end = round(0.15*len(y1)), round(0.8*len(y1))
-    # y1 = y1[start:end]
+    ds1 = ds1[:,np.any(~np.isnan(ds1), axis=0)]
+    ys.append(np.nanmean(ds1, axis=0))
+    if ds2 is not None:
+        ds2 = ds2[:,np.any(~np.isnan(ds2), axis=0)]
+        ys.append(np.nanmean(ds2, axis=0))
+   
+    n_points = len(ys[0])
 
     #FIX!!!!!!!!
     sigma_x = {}
     x = np.arange(n_points)
 
     if n_points < 450:
-        x_interp = np.linspace(0, n_points, 1000)
-        y_interp = np.interp(x_interp, x, y1)
-        data = np.array([x_interp, y_interp]).T
-
-        x,y1 = x_interp, y_interp
-    else:
-        data = np.array([x, y1]).T
-        
-    smooth_y1 = gaussian_convolution_nonuniform(x, y1, sigma_x=2)
-    smooth_data = np.array([x, smooth_y1]).T
+        x_interp = np.linspace(0, n_points-1, 1000)
+        ys = [np.interp(x_interp, x, y) for y in ys]
+        x = x_interp
+    
+    smooth_ys = [gaussian_convolution_nonuniform(x, y, sigma_x=20)
+                 for y in ys]
+    
+    data = np.column_stack((x, *ys))
+    smooth_data = np.column_stack((x, *smooth_ys))
 
     table, fig, model, u, losses, init_p = run_optimization(smooth_data, 
                                                             data, 
@@ -54,6 +104,8 @@ def process_h5_data(job, config, fig_dir, history=False, progress_cb=None):
                                                             config.w_bounds)
     #self.init_p = init_p if self.prev_ip else None
 
+    for n, p in model.named_parameters():
+        print(n, p)
 
     if config.save_loc:
         fig_path = os.path.join(fig_dir, f"{file_name}_profile{file_num}.png")
