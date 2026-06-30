@@ -20,15 +20,14 @@ from PyQt5.QtWidgets import (
     QPushButton, QMenuBar, QMenu, QAction, QFileDialog, QSizePolicy, QLineEdit,
     QComboBox, QRadioButton, QButtonGroup, QDialog, QMessageBox, QTableWidget, 
     QTableWidgetItem, QTabWidget, QMainWindow, QSlider, QSplitter,
-    QApplication, QCheckBox, QProgressBar, QListView, QStackedWidget
+    QApplication, QCheckBox, QProgressBar, QListView, QStackedWidget,
 )
-from PyQt5.QtWebEngineWidgets import QWebEngineView
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from PyQt5.QtCore import Qt, pyqtSlot, QObject, QUrl, QThread
 from profile_evaluation_v3 import EvalCoordinator
 from PyQt5.QtWebChannel import QWebChannel
-from PyQt5.QtGui import QColor, QPainter, QBrush, QIcon, QFont
+from PyQt5.QtGui import QColor, QPainter, QBrush, QIcon, QFont, QStandardItem
 from dataclasses import dataclass
 
 
@@ -88,6 +87,16 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("PFDHA")
         self.setMinimumSize(1400, 1100)
+
+        self.shutdown_requested = False
+        self.force_close = False
+        self.shutdown_label = QLabel("Shutting Down ... finishing running profiles")
+        self.shutdown_label.setStyleSheet(
+            "font-size: 22px; font-weight: bold; color: #aa0000; padding: 10px;"
+        )
+        self.shutdown_label.hide()
+        self.cancel_requested = False
+        self.processing_active = False
         
         # Column Names
         self.strike = 'strike'
@@ -134,6 +143,12 @@ class MainWindow(QWidget):
         # QTimer.singleShot(1000, lambda: print("Sizes:", self.screen_split.sizes()))
 
     def closeEvent(self, event):
+        # This is the second close triggered by finish_graceful_close().
+        # Accept it without asking again.
+        if getattr(self, "force_close", False):
+            event.accept()
+            return
+
         reply = QMessageBox.question(
             self,
             "Exit Confirmation",
@@ -142,11 +157,96 @@ class MainWindow(QWidget):
             QMessageBox.No
         )
 
-        if reply == QMessageBox.Yes:
-            event.accept()
-        else:
+        if reply != QMessageBox.Yes:
             event.ignore()
+            return
 
+        # If no evaluation is running, close normally.
+        if not hasattr(self, "thread") or self.thread is None or not self.thread.isRunning():
+            event.accept()
+            return
+
+        # Evaluation is running.
+        # Do NOT close yet. Keep the GUI alive so the label can repaint.
+        event.ignore()
+        self.begin_graceful_shutdown()
+
+    
+    def begin_graceful_shutdown(self):
+        if getattr(self, "shutdown_requested", False):
+            return
+
+        self.shutdown_requested = True
+
+        if self.shutdown_label.parent() is None:
+            #self.main_area_layout.insertWidget(0, self.shutdown_label)
+            self.main_area_layout.setAlignment(Qt.AlignCenter)
+            self.main_area_layout.addWidget(self.shutdown_label)
+
+        # self.shutdown_label.setText(
+        #     "Shutting Down... finishing running calculations."
+        # )
+        self.shutdown_label.show()
+
+        try:
+            self.start_button.setEnabled(False)
+        except Exception:
+            pass
+
+        try:
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(False)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "worker") and self.worker is not None:
+                self.worker.shutdown_after_running_jobs()
+        except Exception as e:
+            print("Shutdown request failed:", e)
+
+
+    def on_eval_worker_finished(self, results):
+        self.processing_active = False
+
+        if getattr(self, "shutdown_requested", False):
+            self.finish_graceful_close()
+            return
+
+        if getattr(self, "cancel_requested", False):
+            self.shutdown_label.setText("Processing canceled. Running profiles may finish, but no new profiles will start.")
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(False)
+            return
+
+        # Normal completion
+        try:
+            self.pause_btn.setEnabled(False)
+            self.resume_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(False)
+        except Exception:
+            pass
+
+        self.shutdown_label.hide()
+
+    def finish_graceful_close(self):
+        for window in list(getattr(self, "open_windows", [])):
+            try:
+                window.close()
+            except Exception:
+                pass
+
+        try:
+            if hasattr(self, "thread") and self.thread is not None:
+                self.thread.quit()
+                self.thread.wait(3000)
+        except Exception:
+            pass
+
+        self.force_close = True
+        self.close()
 
     def initUI(self):
         # Menu Bar
@@ -398,7 +498,8 @@ class MainWindow(QWidget):
 
 
     def open_map_view(self):
-
+        from PyQt5.QtWebEngineWidgets import QWebEngineView
+        
         map_sftwr = self.variable_input['map_sftwr'].checkedId()
 
         map_window = QMainWindow()
@@ -1155,8 +1256,222 @@ class MainWindow(QWidget):
         return coords if pd.notna(coords).all() else None
     
 
+    def read_txt(self, is_file, folder, num_files, folder_name):
+        test_file = self.curr_path if is_file else next(self.curr_path.iterdir())
+
+        cols_data = self.get_txt_cols(test_file)
+        if cols_data is None:
+            return None
+        
+        self.cols, self.new_names, prof_id, self.delim, self.header = cols_data[0], cols_data[1], cols_data[2], cols_data[3], cols_data[4]
+        self.num_profs[folder_name] = 0
+        single_prof_count = 0
+        n_profs_counts = []
+
+        jobs = []
+        i = 0
+        while i < num_files:
+            file = folder[i]
+            file_name, file_num = self.get_path_name(file)
+            data = pd.read_csv(file, delimiter=self.delim, header=self.header)
+            df = data[self.cols].rename(columns=self.new_names)
+
+            # Single Profile in File
+            if prof_id == "None":
+                coords = self.process_locations(df.iloc[0], i) if self.loc_format else None
+                jobs.append({'df': df, 
+                             'file_num': file_name, 
+                             'coords': coords, 
+                             'file_key': (file_name, single_prof_count, None),
+                             'file_info': (file, None)})
+                single_prof_count += 1
+                
+            else:
+                profiles = df.groupby(self.ids)
+                profile_ids = list(profiles.groups.keys())[:3]
+                num_ids = len(profile_ids)
+                n_profs_counts.append(num_ids)
+
+                for id_idx in range(num_ids):
+                    curr_prof_id = profile_ids[id_idx]
+                    orig_prof = profiles.get_group(curr_prof_id)
+                    coords = self.process_locations(orig_prof.iloc[0], curr_prof_id) if self.loc_format else None
+                    jobs.append({'df': orig_prof, 
+                                 'file_num': curr_prof_id, 
+                                 'coords': coords, 
+                                 'file_key': (file_name, id_idx, i), #file_name, profile index, file index
+                                 'file_info': (file, curr_prof_id)})
+ 
+
+            i += 1
+
+        self.file_list = single_prof_count*[None]
+        t = 0
+        for count in n_profs_counts:
+            t += count
+            self.file_list.append(count*[None])
+
+        total_profs_num = num_files if prof_id == "None" else t
+        self.progress_bar.setMaximum(total_profs_num)
+        self.progress_bar.setParent(self.main_area)
+
+        return jobs
+
+
+    def read_h5(self, folder, num_files):
+        subset = self.get_h5_subset(num_files)
+        if subset is None:
+            return None
+
+        jobs = []
+        for curr_file_i in range(num_files):
+            f_path = folder[curr_file_i]
+            f = h5py.File(f_path, 'r')
+            file_keys = list(f.keys())
+
+            groups = [f[k] for k in file_keys]
+            prof_keys = list(groups[0].keys())
+
+            if isinstance(subset, list) and subset[curr_file_i] != "":
+                keys = []
+                for text in subset[curr_file_i]:
+                    profs = text.split("-")
+                    profs = [prof.strip() for prof in profs]
+                    if len(profs) == 1:
+                        keys.append(prof_keys.index(profs[0]))
+                    else:
+                        keys.extend(list(range(prof_keys.index(profs[0]),
+                                               prof_keys.index(profs[1]))))
+                keys.sort()
+                        
+            else:
+                keys = range(len(prof_keys))
+            
+            self.progress_bar.setMaximum(len(keys))
+            self.progress_bar.setParent(self.main_area)
+
+            file_name, _ = self.get_path_name(f_path)
+            init_p = None
+
+            self.file_list.append(len(keys)*[None])
+            file_list_idx = 0
+            for k in keys:
+                key = prof_keys[k]
+                print("KEY ", key, key[key.rfind("_") + 1:])
+                ds1 = np.array(groups[0][key])
+                ds2 = np.array(groups[1][key]) if len(groups) == 2 else None
+
+                coords = self.process_locations(None, k) if self.loc_format else None
+                jobs.append({'df1': ds1,
+                             'df2': ds2,
+                             'file_num': key[key.rfind("_") + 1:], # profile_id format: profile_num
+                             'coords': coords, 
+                             'file_key': (file_name, file_list_idx, curr_file_i),
+                             'file_info': (f_path, k)})
+                file_list_idx += 1
+        return jobs
+    
+    def pause_evaluation(self):
+        if hasattr(self, "worker") and self.worker is not None:
+            self.worker.pause()
+
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+
+
+    def resume_evaluation(self):
+        if hasattr(self, "worker") and self.worker is not None:
+            self.worker.resume()
+
+        self.pause_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+
+
+    def cancel_evaluation(self):
+        reply = QMessageBox.question(
+            self,
+            "Cancel Processing",
+            "Cancel profile processing?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        self.cancel_requested = True
+
+        if self.shutdown_label.parent() is None:
+            self.main_area_layout.insertWidget(0, self.shutdown_label)
+
+        self.shutdown_label.setText("Canceling... stopping queued profile calculations.")
+        self.shutdown_label.show()
+
+        self.pause_btn.setEnabled(False)
+        self.resume_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+
+        if hasattr(self, "worker") and self.worker is not None:
+            self.worker.cancel()
+
+    def on_eval_paused(self):
+        self.shutdown_label.setText(
+            "Paused. Running profiles may finish, but no new profiles will start."
+        )
+        if self.shutdown_label.parent() is None:
+            self.main_area_layout.insertWidget(0, self.shutdown_label)
+        self.shutdown_label.show()
+
+
+    def on_eval_resumed(self):
+        if not getattr(self, "shutdown_requested", False):
+            self.shutdown_label.hide()
+    
+    def ensure_eval_controls(self):
+        if hasattr(self, "eval_controls_widget"):
+            if self.eval_controls_widget.parent() is None:
+                self.main_area_layout.insertWidget(0, self.eval_controls_widget)
+            self.eval_controls_widget.show()
+            return
+
+        self.eval_controls_widget = QWidget()
+        layout = QHBoxLayout()
+        self.eval_controls_widget.setLayout(layout)
+
+        self.pause_btn = QPushButton("Pause")
+        self.resume_btn = QPushButton("Resume")
+        self.cancel_btn = QPushButton("Cancel")
+
+        self.pause_btn.clicked.connect(self.pause_evaluation)
+        self.resume_btn.clicked.connect(self.resume_evaluation)
+        self.cancel_btn.clicked.connect(self.cancel_evaluation)
+
+        layout.addWidget(self.pause_btn)
+        layout.addWidget(self.resume_btn)
+        layout.addWidget(self.cancel_btn)
+        layout.addStretch()
+
+        self.resume_btn.setEnabled(False)
+
+        self.main_area_layout.setAlignment(Qt.AlignTop)
+        self.main_area_layout.insertWidget(0, self.eval_controls_widget)
+        self.eval_controls_widget.show()
+
     def start_evaluation(self, jobs):
         print(datetime.now())
+
+        self.shutdown_requested = False
+        self.cancel_requested = False
+        self.force_close = False
+        self.processing_active = True
+
+        self.ensure_eval_controls()
+        self.pause_btn.setEnabled(True)
+        self.resume_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+
         self.thread = QThread()
         self.worker = EvalCoordinator(jobs, self.config)
         self.worker.moveToThread(self.thread)
@@ -1168,19 +1483,25 @@ class MainWindow(QWidget):
         #self.worker.finished.connect(self.on_eval_finished)
         self.worker.error.connect(self.on_eval_error)
 
+        self.worker.finished.connect(self.on_eval_worker_finished)
         self.worker.finished.connect(self.thread.quit)
 
-        # self.worker.paused.connect(self.on_paused)
-        # self.worker.resumed.connect(self.on_resumed)
+        self.worker.paused.connect(self.on_eval_paused)
+        self.worker.resumed.connect(self.on_eval_resumed)
 
         self.thread.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self.on_eval_thread_finished)
 
         self.thread.start()
 
     def on_profile_progress(self, completed):
         self.completed_prof_num += 1
         self.progress_bar.setValue(completed)
+
+    def on_eval_thread_finished(self):
+        self.worker = None
+        self.thread = None
 
 
     def on_profile_result_ready(self, r):
@@ -1197,139 +1518,54 @@ class MainWindow(QWidget):
             self.selector_view_initialized = True
         else:
             # Later results: refresh the displayed selector/list
-            self.refresh_file_selector_after_result()
+            self.refresh_file_selector_after_result(r)
 
     def refresh_file_selector_after_result(self, r=None):
         """
-        Refresh the selector without resetting the user's navigation state.
+        Refresh the visible selector using the existing SelectorListModel system.
 
-        Cases:
-        1. User is looking at top-level files:
-        -> refresh the file list.
-        2. User is inside one file that has multiple profiles:
-        -> refresh only that file's profile list.
-        3. User is already viewing a completed profile:
-        -> do not force navigation away from it.
-
-        Assumes:
-        - self.file_list stores either:
-            result_dict
-            or list/dict of result_dict / None for multi-profile files
-        - result["file_key"] is:
-            (file_name, prof_idx, file_idx)
+        This does not force the user back to the file selector.
+        It only rebuilds the model for the selector page the user is currently viewing.
         """
+
+        view_state = getattr(self, "selector_mode", "files")
 
         if r is not None:
-            file_name, prof_idx, file_idx = r["file_key"]
+            _, _, finished_file_idx = r["file_key"]
         else:
-            file_name = prof_idx = file_idx = None
+            finished_file_idx = None
 
-        # Track where the user currently is.
-        # These are set by show_file_selector_run() / show_profile_selector().
-        view_state = getattr(self, "selector_view_state", "files")
-
+        # User is looking at the top-level file list.
         if view_state == "files":
-            self._rebuild_file_selector_model()
+            self.selector_model.set_items(
+                self.file_list,
+                mode="files"
+            )
+            #self.selector_view.setModel(self.selector_model)
             return
 
+        # User is looking at the profile list for one multi-profile file.
         if view_state == "profiles":
-            current_file_idx = getattr(self, "current_profile_file_idx", None)
+            current_file_idx = getattr(self, "current_file_idx", None)
 
-            # If the finished result belongs to the file currently open,
-            # refresh the profile list for that file.
-            if file_idx == current_file_idx or r is None:
-                self._rebuild_profile_selector_model(current_file_idx)
-            else:
-                # Result belongs to another file, so do not disturb current profile selector.
-                # Top-level file status will update when user goes back.
-                pass
+            # Only refresh this list if the newly finished result belongs to
+            # the file currently being viewed.
+            if finished_file_idx is None or finished_file_idx == current_file_idx:
+                #profiles = self.file_list[current_file_idx]
+
+                self.selector_model.set_items(
+                    self.file_list[current_file_idx],
+                    mode="profiles"
+                )
+                #self.selector_view.setModel(self.selector_model)
 
             return
 
+        # User is viewing an actual profile result.
+        # Do not change the page or replace the view while they are looking at it.
         if view_state == "result":
-            # User is already viewing a profile result.
-            # Do not rebuild the selector or force them back.
             return
     
-    def _rebuild_file_selector_model(self):
-        """
-        Rebuilds the top-level file selector model.
-        Shows each file as either:
-        - Processing...
-        - Complete
-        - x/y profiles complete
-        """
-
-        model = self.selector_model
-        model.clear()
-
-        for file_idx, item in enumerate(self.file_list):
-            if isinstance(item, dict):
-                file_name, _, _ = item["file_key"]
-                label = f"{file_name}  ✓ Complete"
-
-                qitem = QStandardItem(label)
-                qitem.setData(("result", file_idx, None), Qt.UserRole)
-
-            elif isinstance(item, (list, tuple)):
-                completed = sum(1 for p in item if p is not None)
-                total = len(item)
-
-                # Try to get file name from the first completed profile.
-                file_name = None
-                for p in item:
-                    if p is not None:
-                        file_name = p["file_key"][0]
-                        break
-
-                if file_name is None:
-                    file_name = f"File {file_idx}"
-
-                label = f"{file_name}  ({completed}/{total} profiles complete)"
-
-                qitem = QStandardItem(label)
-                qitem.setData(("profiles", file_idx, None), Qt.UserRole)
-
-            else:
-                label = f"File {file_idx}  Processing..."
-                qitem = QStandardItem(label)
-                qitem.setData(("pending", file_idx, None), Qt.UserRole)
-                qitem.setEnabled(False)
-
-            model.appendRow(qitem)
-
-        self.selector_view.setModel(model)
-
-    def _rebuild_profile_selector_model(self, file_idx):
-        """
-        Rebuilds the profile selector for one multi-profile file.
-        Completed profiles are clickable.
-        Pending profiles are shown but disabled.
-        """
-
-        if file_idx is None:
-            return
-
-        profiles = self.file_list[file_idx]
-
-        model = self.selector_model
-        model.clear()
-
-        for prof_idx, result in enumerate(profiles):
-            if result is None:
-                label = f"Profile {prof_idx}  Processing..."
-                qitem = QStandardItem(label)
-                qitem.setEnabled(False)
-                qitem.setData(("pending", file_idx, prof_idx), Qt.UserRole)
-            else:
-                file_num = result.get("file_num", prof_idx)
-                label = f"Profile {file_num}  ✓ Complete"
-                qitem = QStandardItem(label)
-                qitem.setData(("result", file_idx, prof_idx), Qt.UserRole)
-
-            model.appendRow(qitem)
-
-        self.selector_view.setModel(model)
 
     # def on_eval_finished(self, results):
     #     print(datetime.now())
@@ -1375,127 +1611,15 @@ class MainWindow(QWidget):
             "Processing Error",
             f"An error occurred while processing data:\n\n{message}"
         )
-
-    
-    def read_txt(self, is_file, folder, num_files, folder_name):
-        test_file = self.curr_path if is_file else next(self.curr_path.iterdir())
-
-        cols_data = self.get_txt_cols(test_file)
-        if cols_data is None:
-            return None
-        
-        self.cols, self.new_names, prof_id, self.delim, self.header = cols_data[0], cols_data[1], cols_data[2], cols_data[3], cols_data[4]
-        total_profs_num = num_files if prof_id == "None" else 0
-        self.progress_bar.setMaximum(total_profs_num)
-        self.progress_bar.setParent(self.main_area)
-        #self.progress_bar.show()
-        self.num_profs[folder_name] = 0
-        single_prof_count = 0
-        n_profs_counts = []
-
-        jobs = []
-        i = 0
-        while i < num_files:
-            file = folder[i]
-            file_name, file_num = self.get_path_name(file)
-            data = pd.read_csv(file, delimiter=self.delim, header=self.header)
-            df = data[self.cols].rename(columns=self.new_names)
-
-            # Single Profile in File
-            if prof_id == "None":
-                coords = self.process_locations(df.iloc[0], i) if self.loc_format else None
-                jobs.append({'df': df, 
-                             'file_num': file_name, 
-                             'coords': coords, 
-                             'file_key': (file_name, single_prof_count, None),
-                             'file_info': (file, None)})
-                single_prof_count += 1
-                
-            else:
-                profiles = df.groupby(self.ids)
-                profile_ids = list(profiles.groups.keys())[:3]
-                num_ids = len(profile_ids)
-                n_profs_counts.append(num_ids)
-                total_profs_num += num_ids
-                self.progress_bar.setMaximum(total_profs_num)
-
-                for id_idx in range(num_ids):
-                    curr_prof_id = profile_ids[id_idx]
-                    orig_prof = profiles.get_group(curr_prof_id)
-                    coords = self.process_locations(orig_prof.iloc[0], curr_prof_id) if self.loc_format else None
-                    jobs.append({'df': orig_prof, 
-                                 'file_num': curr_prof_id, 
-                                 'coords': coords, 
-                                 'file_key': (file_name, id_idx, i), #file_name, profile index, file index
-                                 'file_info': (file, curr_prof_id)})
- 
-
-            i += 1
-
-        self.file_list = single_prof_count*[None]
-        for count in n_profs_counts:
-            self.file_list.append(count*[None])
-
-        return jobs
-
-
-    def read_h5(self, folder, num_files):
-        subset = self.get_h5_subset(num_files)
-        if subset is None:
-            return None
-
-        jobs = []
-        for curr_file_i in range(num_files):
-            f_path = folder[curr_file_i]
-            f = h5py.File(f_path, 'r')
-            file_keys = list(f.keys())
-
-            groups = [f[k] for k in file_keys]
-            prof_keys = list(groups[0].keys())
-
-            if isinstance(subset, list) and subset[curr_file_i] != "":
-                keys = []
-                for text in subset[curr_file_i]:
-                    profs = text.split("-")
-                    profs = [prof.strip() for prof in profs]
-                    if len(profs) == 1:
-                        keys.append(prof_keys.index(profs[0]))
-                    else:
-                        keys.extend(list(range(prof_keys.index(profs[0]),
-                                               prof_keys.index(profs[1]))))
-                keys.sort()
-                        
-            else:
-                keys = range(len(prof_keys))
-            
-            total_profs_num = len(keys)
-
-            file_name, _ = self.get_path_name(f_path)
-            init_p = None
-
-            self.file_list.append(len(keys)*[None])
-            file_list_idx = 0
-            for k in keys:
-                key = prof_keys[k]
-                print("KEY ", key, key[key.rfind("_") + 1:])
-                ds1 = np.array(groups[0][key])
-                ds2 = np.array(groups[1][key]) if len(groups) == 2 else None
-
-                coords = self.process_locations(None, k) if self.loc_format else None
-                jobs.append({'df1': ds1,
-                             'df2': ds2,
-                             'file_num': key[key.rfind("_") + 1:], # profile_id format: profile_num
-                             'coords': coords, 
-                             'file_key': (file_name, file_list_idx, curr_file_i),
-                             'file_info': (f_path, k)})
-                file_list_idx += 1
-        return jobs
-    
+  
 
     def setup_selector_view(self):
         self.selector_view = QListView()
         self.selector_view.setUniformItemSizes(True)
         self.selector_view.setSpacing(2)
+
+        self.selector_model = SelectorListModel([], mode="files", parent=self)
+        self.selector_view.setModel(self.selector_model)
 
         self.selector_view.setStyleSheet("""
             QListView {
@@ -1539,7 +1663,7 @@ class MainWindow(QWidget):
 
             self.main_area_layout.setAlignment(Qt.AlignTop)
 
-            # Optional: keep progress bar above the stack
+            self.ensure_eval_controls()
             self.main_area_layout.addWidget(self.progress_bar)
             self.progress_bar.show()
 
@@ -1555,16 +1679,20 @@ class MainWindow(QWidget):
 
         self.proc_panel_title.setText("SELECT FILE")
 
-        self.selector_model = SelectorListModel(
+        # self.selector_model = SelectorListModel(
+        #     self.file_list,
+        #     mode="files",
+        #     parent=self
+        # )
+
+        self.selector_model.set_items(
             self.file_list,
-            mode="files",
-            parent=self
+            mode="files"
         )
 
-        self.selector_view.setModel(self.selector_model)
+        #self.selector_view.setModel(self.selector_model)
         self.main_stack.setCurrentWidget(self.selector_page)
         self.selector_view.show()
-
 
     def on_selector_row_clicked(self, index):
         row = index.row()
@@ -1573,32 +1701,36 @@ class MainWindow(QWidget):
             file_idx = row
             file_item = self.file_list[file_idx]
 
+            if file_item is None:
+                return
+
             if isinstance(file_item, list):
-                # This file contains multiple profiles
                 self.show_profile_selector(file_idx)
             else:
-                # This file is a single profile
                 self.display_profile(file_idx, None)
 
         elif self.selector_mode == "profiles":
             profile_idx = row
             file_idx = self.current_file_idx
 
+            if self.file_list[file_idx][profile_idx] is None:
+                return
+
             self.display_profile(file_idx, profile_idx)
-            
+
+
     def show_profile_selector(self, file_idx):
         self.selector_mode = "profiles"
         self.current_file_idx = file_idx
 
         profiles = self.file_list[file_idx]
 
-        self.selector_model = SelectorListModel(
+        self.selector_model.set_items(
             profiles,
-            mode="profiles",
-            parent=self
+            mode="profiles"
         )
 
-        self.selector_view.setModel(self.selector_model)
+        #self.selector_view.setModel(self.selector_model)
         self.main_stack.setCurrentWidget(self.selector_page)
         self.selector_view.show()
 
@@ -1653,6 +1785,7 @@ class MainWindow(QWidget):
     def display_profile(self, file_index, profile_index):
         self.last_file_idx = file_index
         self.last_profile_idx = profile_index
+        self.selector_mode = "result"
 
         #self.clear_layout_detach(self.processing_panel)
 

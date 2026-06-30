@@ -4,7 +4,7 @@ from optimize_v3 import run_optimization
 from PyQt5 import QtCore
 from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 from multiprocessing import get_context
-from concurrent.futures import wait, FIRST_COMPLETED
+from concurrent.futures import wait, FIRST_COMPLETED, CancelledError
 from datetime import datetime
 import os
 import traceback
@@ -121,10 +121,22 @@ class EvalCoordinator(QtCore.QObject):
         self.jobs = jobs
         self.config = config
 
+        self.pool = None
+        self.futures = set()
+
         self.pause_signal = False
         self.abort_signal = False
+        self.shutdown_signal = False
         self.lock_signal = QtCore.QMutex()
         self.wait_signal = QtCore.QWaitCondition()
+
+    def _read_flags(self):
+        self.lock_signal.lock()
+        abort = self.abort_signal
+        paused = self.pause_signal
+        shutting_down = self.shutdown_signal
+        self.lock_signal.unlock()
+        return abort, paused, shutting_down
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -157,20 +169,22 @@ class EvalCoordinator(QtCore.QObject):
                     mp_context=ctx,
                     max_workers=max_workers
                 ) as pool:
+                    
+                    self.pool = pool
+                    self.futures = set()
 
-                    futures = set()
                     job_iter = iter(self.jobs)
 
                     for _ in range(max_workers):
                         try:
                             job = next(job_iter)
-                            futures.add(
+                            self.futures.add(
                                 pool.submit(comp_func, job, self.config, fig_dir)
                             )
                         except StopIteration:
                             break
 
-                    while futures:
+                    while self.futures:
 
                         self.lock_signal.lock()
                         abort = self.abort_signal
@@ -190,23 +204,40 @@ class EvalCoordinator(QtCore.QObject):
                             self.resumed.emit()
                             continue
 
-                        done, futures = wait(
-                            futures,
+                        done, remaining = wait(
+                            self.futures,
                             return_when=FIRST_COMPLETED
                         )
 
+                        self.futures = remaining
+
                         for fut in done:
 
-                            if self.abort_signal:
-                                pool.shutdown(wait=False, cancel_futures=True)
+                            abort, paused, shutting_down = self._read_flags()
+
+                            if abort:
                                 break
 
                             try:
                                 result = fut.result()
+                            except CancelledError:
+                                # expected during cancel or shutdown
+                                continue
+                            
+                            except Exception:
+                                abort, paused, shutting_down = self._read_flags()
+
+                                if not abort and not shutting_down:
+                                    self.error.emit(traceback.format_exc())
+                                continue
+
+                            abort, paused, shutting_down = self._read_flags()
+
+                            if not abort and not shutting_down:
                                 results.append(result)
 
                                 writer.writerow([result["file_num"],
-                                                 result["losses"]["total_loss"][-1]])
+                                                result["losses"]["total_loss"][-1]])
 
                                 if self.config.save_loc:
                                     curr_table = result["table"]
@@ -218,19 +249,27 @@ class EvalCoordinator(QtCore.QObject):
                                 self.result_ready.emit(result)
                                 self.progress.emit(completed)
 
-                            except Exception:
-                                self.error.emit(traceback.format_exc())
+                            # Submit another job only if:
+                            # - not aborting
+                            # - not shutting down
+                            # - not paused
+                            abort, paused, shutting_down = self._read_flags()
 
-                            try:
-                                job = next(job_iter)
-                                futures.add(
-                                    pool.submit(comp_func, job, self.config, fig_dir)
-                                )
-                            except StopIteration:
-                                pass
+                            if not abort and not paused and not shutting_down:
+                                try:
+                                    job = next(job_iter)
 
-            if not self.abort_signal:
-                self.finished.emit(results)
+                                    self.futures.add(
+                                        pool.submit(comp_func, job, self.config, fig_dir)
+                                    )
+                                except StopIteration:
+                                    pass
+                        
+                        if self.abort_signal:
+                            break
+            self.pool = None
+            self.futures = set()
+            self.finished.emit(results)
         except Exception:
             self.error.emit(traceback.format_exc())
 
@@ -248,11 +287,52 @@ class EvalCoordinator(QtCore.QObject):
         self.wait_signal.wakeAll()
         self.lock_signal.unlock()
 
+
     @QtCore.pyqtSlot()
     def cancel(self):
         self.lock_signal.lock()
         self.abort_signal = True
+        self.shutdown_signal = False
+        self.pause_signal = False
         self.wait_signal.wakeAll()
         self.lock_signal.unlock()
 
+        # Cancel queued futures
+        try:
+            for fut in list(getattr(self, "futures", [])):
+                fut.cancel()
+        except Exception:
+            pass
 
+        # Stop the process pool
+        try:
+            if getattr(self, "pool", None) is not None:
+                self.pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+
+    @QtCore.pyqtSlot()
+    def shutdown_after_running_jobs(self):
+        """
+        GUI is closing.
+
+        Behavior:
+        - Do not submit any more jobs.
+        - Do not emit completed profile results to the GUI.
+        - Let already-running run_optimization calls finish.
+        - Then emit finished so the GUI can close.
+        """
+        self.lock_signal.lock()
+        self.shutdown_signal = True
+        self.pause_signal = False
+        self.wait_signal.wakeAll()
+        self.lock_signal.unlock()
+
+        # Cancel futures that have not started yet.
+        # Running futures will continue until run_optimization returns.
+        try:
+            for fut in list(getattr(self, "futures", [])):
+                fut.cancel()
+        except Exception:
+            pass
