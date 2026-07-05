@@ -120,7 +120,7 @@ def _rup(y):
    
 
 class Data:
-    def __init__(self, data, prof_id, init_p, rand=False, learn_rate=1e-5, n_epochs=None):
+    def __init__(self, data, prof_id, init_p, device, rand=False, learn_rate=1e-5, n_epochs=None):
         self.data = data
         self.prof_id = prof_id
         self.init_p = init_p
@@ -139,27 +139,28 @@ class Data:
 
         self.lr = learn_rate
         self.n_epochs = n_epochs
+        self.device = device
 
 
 def fit_data(input):
     data_obj, history = input
     model, losses = NN_optimize(data_obj, history)
 
-    return model, losses, data_obj
+    return model, losses
 
 
-def run_optimization(data, orig_data, prof_num, sigma, rand=False, uncert=False, coords=None, win_bounds=None, init_p=None, history=False):
+def run_optimization(smooth_data, orig_data, prof_num, sigma, rand=False, uncert=False, coords=None, win_bounds=None, init_p=None, history=False, device="cpu"):
     # Normaliztion of non-smoothed original data
     data_norm_orig, _, _ = prof_normalization(orig_data)
     data_norm_loc_orig  = data_norm_orig[:,0]
     data_norm_disp_orig = data_norm_orig[:,1:]
     data_norm_disp_orig = data_norm_disp_orig[:,np.newaxis] if len(data_norm_disp_orig.shape) == 1 else data_norm_disp_orig
 
-    data_obj = Data(data, prof_num, init_p, rand)
+    data_obj = Data(smooth_data, prof_num, init_p, device, rand)
 
     # Fit with standard initial parameters based on the data
     if not rand:
-        model, losses, data_obj = fit_data([data_obj, history])     
+        model, losses = fit_data([data_obj, history])     
         
     # Fit with 10 sets of random inital parameters to find an optimal fit
     else:
@@ -172,14 +173,14 @@ def run_optimization(data, orig_data, prof_num, sigma, rand=False, uncert=False,
 
         for o in out:
             if o[1]['total_loss'][-1] < min_loss:
-                model, losses, data_obj = o
+                model, losses = o
                 min_loss = o[1]['total_loss'][-1]
 
     if history:
         return model, losses, data_obj.x, data_obj.y, data_obj.scale_shift
 
     table, norm_vals, scaled_vals, lin_seg, _, org_p = post_process_params_v4(data_obj, model, coords)
-    data_obj.init_p = (org_p, data_obj.param_bounds) if init_p else None
+    init_p = (org_p, data_obj.param_bounds) if init_p else None
 
     if uncert:
         i = 0
@@ -237,12 +238,10 @@ def run_optimization(data, orig_data, prof_num, sigma, rand=False, uncert=False,
         ax[0].set_xlabel("Normalized Distance Along Profile", fontdict={'size': 33})
         ax[0].set_ylabel("Displacement", fontdict={'size': 33})
 
-        # ax[1].plot(data[:,0], data[:,1], 'o')
-        # ax[1].plot(np.linspace(data[0,0], data[-1,0], len(scaled_vals)), scaled_vals, '-')
+        # ax[1].plot(smooth_data[:,0], smooth_data[:,1], 'o')
         ax[1].plot(orig_data[:,0], orig_data[:,1], 'o')
-        ax[1].plot(np.arange(len(scaled_vals)), scaled_vals, '-', linewidth=3)
-        #ax[1].plot(np.arange(len(norm_vals)), norm_vals, '-', linewidth=3)
-        #ax.plot(np.linspace(data[0,0], data[-1,0], len(scaled_vals)), scaled_vals, '-')
+        #ax[1].plot(np.arange(len(scaled_vals)), scaled_vals, '-', linewidth=3)
+        ax[1].plot(np.linspace(smooth_data[0,0], smooth_data[-1,0], len(scaled_vals)), scaled_vals, '-', linewidth=3)
         ax[1].set_title("Rescaled")
         ax[1].grid(True, linewidth=1.8)
         ax[1].tick_params(axis='both', labelsize=20)
@@ -250,4 +249,4 @@ def run_optimization(data, orig_data, prof_num, sigma, rand=False, uncert=False,
         ax[1].set_ylabel("Displacement", fontdict={'size': 33})
 
     
-    return table, fig, model, uncertainties, losses, data_obj.init_p
+    return table, fig, model, uncertainties, losses, init_p

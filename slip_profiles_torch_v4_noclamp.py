@@ -206,10 +206,12 @@ def set_trainable(model_params, vars):
         
 
 def rmse(y_pred, y_act):
-    return torch.sqrt(torch.mean((y_pred - y_act)**2)).detach().numpy()
+    #return torch.sqrt(torch.mean((y_pred - y_act)**2)).detach().numpy()
+    return torch.sqrt(torch.mean((y_pred - y_act)**2))
 
 def L1(y_pred, y_act):
-    return torch.mean(torch.abs(y_pred - y_act)).detach().numpy()
+    #return torch.mean(torch.abs(y_pred - y_act)).detach().numpy()
+    return torch.mean(torch.abs(y_pred - y_act))
 
 def regional_weighted_loss(y_pred, y_act, loc_params, width_params, scale):
     temp_loc = [float(p.detach()) for p in loc_params]
@@ -272,6 +274,8 @@ def param_transf_to_act(param, bounds):
     return bounds[0] + (bounds[1] - bounds[0])/(1+np.exp(-param))
 
 def NN_optimize(data, collect_param_vals=False):
+    device = torch.device(data.device)
+
     model = SlipProfileNN(ndim=data.n_dim, nrup=data.n_rup,
                           seed_origin=data.param_0['origin'],
                           seed_ramp=data.param_0['ramp'],
@@ -279,14 +283,14 @@ def NN_optimize(data, collect_param_vals=False):
                           seed_width=data.param_0['width'],
                           seed_disp=data.param_0['disp'],
                           seed_slope=data.param_0['slope'],
-                          bounds=data.param_bounds)
+                          bounds=data.param_bounds).to(device)
     
-    named_params = model.named_parameters()
+    named_params = list(model.named_parameters())
 
     x, y = data.x, data.y
     scale = data.scale_shift[0]
     learn_rate, n_epoch = data.lr, data.n_epochs
-    x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0).T
+    x_tensor = torch.tensor(x, dtype=torch.float32, device=device).unsqueeze(0).T
     
     width_p = []
     loc_p = []
@@ -302,37 +306,26 @@ def NN_optimize(data, collect_param_vals=False):
             if name[-3:] == "loc":
                 loc_p.append(param)
             non_width_p.append(param)
- 
-    opt_params = [
-        {'params': width_p, 'lr':0.01},
-        {'params': non_width_p, 'lr': 1e-3}
-    ]
 
     opt = torch.optim.Adam(model.parameters())
-    #opt = torch.optim.Adam(opt_params)
     loss_fn = torch.nn.MSELoss()
-    #loss_fn = loc_loss
 
-    y_b = torch.tensor(y, dtype=torch.float32)
+    y_b = torch.tensor(y, dtype=torch.float32, device=device)
     y_pred = model(x_tensor)
     if data.n_dim > 1:
         y_b = torch.concat((y_b[:,0], y_b[:,1]))
         y_pred = torch.concat((y_pred[:,0], y_pred[:,1]))
 
-    #prev_loss = loss_fn(y_pred, y_b).item()
     prev_loss = loss_fn(y_pred, y_b).item()
     losses['total_loss'].append(prev_loss)
-    total_n_epochs = 0
         
     def training_loop(ratio_limit, iter_limit, vars, prev_loss, lr=1e-3, lf=None):
-        # global total_n_epochs            
         opt.param_groups[0]['lr'] = lr
         set_trainable(model.named_parameters(), vars)
 
         opt.zero_grad()
         ratio = 0.0
         iter_n = 0
-        #prev_loss = losses['total_loss'][-1]
 
         while True:
             iter_n += 1
@@ -364,7 +357,7 @@ def NN_optimize(data, collect_param_vals=False):
         
         return {'mse': rmse(y_pred, y_b).item(),
                 #"regional": regional_weighted_loss(y_pred, y_b, loc_p, width_p, scale).item(),
-                'L1': L1(y_pred, y_b)}
+                'L1': L1(y_pred, y_b).item()}
         #total_n_epochs += iter_n
 
     l = training_loop(0.99, 20000, ["all_true"], prev_loss)
