@@ -10,7 +10,6 @@ from datetime import datetime
 import torch
 import select_columns
 import select_h5_subset
-import fit_animation
 import create_azimuths
 from helper_funs import plot_disp_graph
 from maps_functions import generate_google_maps_html, generate_leaflet_html
@@ -21,11 +20,12 @@ from PyQt5.QtWidgets import (
     QComboBox, QRadioButton, QButtonGroup, QDialog, QMessageBox, QTableWidget, 
     QTableWidgetItem, QTabWidget, QMainWindow, QSlider, QSplitter,
     QApplication, QCheckBox, QProgressBar, QListView, QStackedWidget,
-    QAbstractItemView, QListWidget, QListWidgetItem
+    QAbstractItemView, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PyQt5.QtCore import Qt, pyqtSlot, QObject, QUrl, QThread
+from matplotlib.ticker import MaxNLocator
+from PyQt5.QtCore import Qt, pyqtSlot, QObject, QUrl, QThread, QSignalBlocker
 from profile_evaluationv4 import EvalCoordinator
 from PyQt5.QtWebChannel import QWebChannel
 from PyQt5.QtGui import QIcon, QFont
@@ -63,34 +63,31 @@ class ProcessingRun:
     input_path: Path
     save_loc: str | None
 
-    # Run configuration / output folders
     config: object | None = None
     temp_fig_folder: Path | None = None
 
-    # Main result structures
     file_list: list = field(default_factory=list)
     loss_graph_vals: list = field(default_factory=list)
     disp_graph_vals: list = field(default_factory=list)
+    completed_vals: list = field(default_factory=list)
 
-    # Profile next/previous navigation cache
     profile_nav_positions: list = field(default_factory=list)
     profile_nav_lookup: dict = field(default_factory=dict)
 
-    # Loss outlier flags
     high_loss_files: set = field(default_factory=set)
     high_loss_profiles: set = field(default_factory=set)
 
-    # Loss tab state
     loss_file_order: list = field(default_factory=list)
     loss_file_checked: dict = field(default_factory=dict)
+    loss_profile_checked: dict = field(default_factory=dict)
+    loss_expanded_files: set = field(default_factory=set)
     loss_x_vals: list = field(default_factory=list)
+    first_unchecked_child: dict = field(default_factory=dict)
+    file_names: list = field(default_factory=list)
 
-    # Run state
-    completed_profiles: int = 0
     total_profiles: int = 0
-    status: str = "created"  # created, running, complete, canceled, error
+    status: str = "created"
 
-    # UI state for this run
     selector_view_initialized: bool = False
     selector_mode: str = "files"
     last_file_idx: int | None = None
@@ -222,9 +219,6 @@ class MainWindow(QWidget):
 
         self.shutdown_label.show()
 
-        if self.temp_fig_folder.is_dir():
-            rmtree(self.temp_fig_folder)
-
         try:
             self.start_button.setEnabled(False)
         except Exception:
@@ -257,6 +251,9 @@ class MainWindow(QWidget):
                 self.thread.wait(3000)
         except Exception:
             pass
+
+        if self.temp_fig_folder.is_dir():
+            rmtree(self.temp_fig_folder)
 
         self.force_close = True
         self.close()
@@ -402,131 +399,220 @@ class MainWindow(QWidget):
 
         self.results_tabs.setCurrentWidget(self.losses_tab)
 
-    def get_list_mode(self, list_type):
-        """
-        Returns:
-            "folder_single_profiles"
-            "single_file_multi_profiles"
-            "folder_multi_profiles"
-            "empty"
-        """
-        if list_type == "loss":
-            if self.active_run is None or not self.active_run.loss_graph_vals:
-                return "empty"
-            vals_list = self.active_run.loss_graph_vals
-
-        has_lists = any(isinstance(item, list) for item in vals_list)
-        has_single_items = any(not isinstance(item, list) for item in vals_list)
-
-        if has_lists and len(vals_list) == 1:
-            return "single_file_multi_profiles"
-
-        if has_lists:
-            return "folder_multi_profiles"
-
-        if has_single_items:
-            return "folder_single_profiles"
-
-        return "empty"
-    
 
     def build_losses_tab(self):
         self.clear_layout_delete(self.losses_tab_layout)
 
-        mode = self.get_list_mode("loss")
-
-        if mode == "empty":
+        run = self.active_run
+        if run is None or not run.loss_graph_vals:
             label = QLabel("No losses are available yet.")
             label.setAlignment(Qt.AlignCenter)
             self.losses_tab_layout.addWidget(label)
             return
 
-        if mode == "folder_single_profiles" or mode == "single_file_multi_profiles":
-
-            if mode == "single_file_multi_profiles":
-                vals_list = self.active_run.loss_graph_vals[0]
-                loss_x_vals = self.active_run.loss_x_vals[0]
-            else:
-                vals_list = self.active_run.loss_graph_vals
-                loss_x_vals = self.active_run.loss_x_vals
-
-            fig = self.make_folder_or_single_nprof_fig(loss_x_vals, vals_list)
-            canvas = FigureCanvas(fig)
-            self.losses_tab_layout.addWidget(canvas)
-            return
-
-        if mode == "folder_multi_profiles":
-            self.build_multi_file_loss_selector()
-            return
-        
-
-    def make_folder_or_single_nprof_fig(self, loss_x_vals, vals_list):
-
-        fig = Figure(figsize=(8, 5))
-        ax = fig.add_subplot(111)
-
-        ax.tick_params(axis='x', labelrotation=90)
-        ax.plot(loss_x_vals, vals_list, marker="o")
-        ax.set_title("Final Loss by File")
-        ax.set_xlabel("File")
-        ax.set_ylabel("Final Loss")
-        ax.grid(True)
-
-        fig.tight_layout()
-        return fig
-    
-
-    def init_loss_file_selection_state(self):
-        run = self.active_run
-        if run is None:
-            return
-
-        n_files = len(run.loss_graph_vals)
-
-        # Initialize if this run has never initialized loss ordering,
-        # or if the structure changed.
-        if len(run.loss_file_order) != n_files:
-            run.loss_file_order = list(range(n_files))
-
-        # Add missing checkbox states, but preserve existing choices.
-        for file_idx in run.loss_file_order:
-            if file_idx not in run.loss_file_checked:
-                run.loss_file_checked[file_idx] = True
-
-        # Remove stale checkbox states if needed.
-        run.loss_file_checked = {
-            file_idx: checked
-            for file_idx, checked in run.loss_file_checked.items()
-            if file_idx in run.loss_file_order
-        }
-
-    def build_multi_file_loss_selector(self):
-        self.init_loss_file_selection_state()
-
         container = QWidget()
         layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.loss_file_list_widget = QListWidget()
-        self.loss_file_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.loss_tree = QTreeWidget()
+        self.loss_tree.setHeaderLabels(["Files / Profiles", "Move"])
+        self.loss_tree.setColumnWidth(0, 320)
+        self.loss_tree.setAlternatingRowColors(True)
 
-        self.populate_loss_file_list_widget()
+        self.updating_loss_tree = False
+
+        self.populate_loss_tree()
+
+        self.loss_tree.itemChanged.connect(self.on_loss_tree_item_changed)
+        self.loss_tree.itemExpanded.connect(self.on_loss_tree_item_expanded)
+        self.loss_tree.itemCollapsed.connect(self.on_loss_tree_item_collapsed)
 
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        left_layout.addWidget(QLabel("Select files and order"))
-        left_layout.addWidget(self.loss_file_list_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.addWidget(QLabel("Select losses to plot"))
+        left_layout.addWidget(self.loss_tree)
 
         self.loss_plot_container = QWidget()
         self.loss_plot_layout = QVBoxLayout(self.loss_plot_container)
         self.loss_plot_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.loss_fig = Figure(figsize=(9, 5))
+        self.loss_ax = self.loss_fig.add_subplot(111)
+        self.loss_canvas = FigureCanvas(self.loss_fig)
+        self.loss_plot_layout.addWidget(self.loss_canvas)
+
+        self.loss_hover_data = None
+        self.loss_hover_annotation = None
+        self.loss_hover_connected = False
+        self.loss_cursor = None
 
         layout.addWidget(left_panel, stretch=1)
         layout.addWidget(self.loss_plot_container, stretch=3)
 
         self.losses_tab_layout.addWidget(container)
 
-        self.update_multi_file_loss_plot_from_list()
+        self.update_loss_plot_from_tree()
+        
+
+    def init_loss_tree_state(self):
+        run = self.active_run
+        if run is None:
+            return
+
+        n_files = len(run.loss_graph_vals)
+
+        # Only top-level files are reorderable, and only in folder_multi_profiles mode.
+        if len(run.loss_file_order) != n_files:
+            run.loss_file_order = list(range(n_files))
+
+        for file_idx in run.loss_file_order:
+            if file_idx not in run.loss_file_checked:
+                run.loss_file_checked[file_idx] = True
+
+        run.loss_file_checked = {
+            file_idx: checked
+            for file_idx, checked in run.loss_file_checked.items()
+            if file_idx in run.loss_file_order
+        }
+
+        # Initialize profile checkbox state.
+        for file_idx, item in enumerate(run.loss_graph_vals):
+            for profile_idx in range(len(item)):
+                key = (file_idx, profile_idx)
+                if key not in run.loss_profile_checked:
+                    run.loss_profile_checked[key] = True      
+
+
+    def populate_loss_tree(self):
+        run = self.active_run
+        if run is None:
+            return
+
+        self.init_loss_tree_state()
+
+        self.updating_loss_tree = True
+        self.loss_tree.clear()
+
+        n_files = len(run.loss_file_order)
+        for row, file_idx in enumerate(run.loss_file_order):
+            file_item = run.file_list[file_idx]
+            file_name = self.get_file_display_name_for_loss(file_idx)
+
+            completed = run.completed_vals[file_idx]
+            total = len(file_item)
+
+            label = f"{file_name}  ({completed}/{total} complete)"
+
+            parent = QTreeWidgetItem([label, ""])
+            parent.setData(0, Qt.UserRole, {
+                "kind": "file",
+                "file_idx": file_idx,
+                "profile_idx": None,
+            })
+
+            parent.setFlags(
+                parent.flags()
+                | Qt.ItemIsUserCheckable
+                | Qt.ItemIsEnabled
+                | Qt.ItemIsSelectable
+            )
+
+            self.loss_tree.addTopLevelItem(parent)
+
+            if n_files > 1:
+            # Add reorder buttons only for top-level files in case 3.
+                move_widget = self.make_loss_file_move_widget(file_idx, row, len(run.loss_file_order))
+                self.loss_tree.setItemWidget(parent, 1, move_widget)
+
+            for profile_idx in range(len(file_item)):
+                self.add_profile_loss_child(parent, run, file_idx, profile_idx)
+            
+            run.first_unchecked_child[file_idx] = None
+            self.update_parent_check_state(parent, file_idx)
+
+            if file_idx in run.loss_expanded_files:
+                parent.setExpanded(True)
+            else:
+                parent.setExpanded(False)
+
+        self.updating_loss_tree = False
+    
+
+    def add_profile_loss_child(self, parent, run, file_idx, profile_idx):
+        label = self.get_profile_label_for_loss(run, file_idx, profile_idx)
+
+        loss = run.loss_graph_vals[file_idx][profile_idx]
+
+        if loss is None:
+            label += "  Processing..."
+
+        child = QTreeWidgetItem([label, ""])
+        child.setData(0, Qt.UserRole, {
+            "kind": "profile",
+            "file_idx": file_idx,
+            "profile_idx": profile_idx,
+        })
+
+        child.setFlags(
+            child.flags()
+            | Qt.ItemIsUserCheckable
+            | Qt.ItemIsEnabled
+            | Qt.ItemIsSelectable
+        )
+
+        checked = run.loss_profile_checked.get((file_idx, profile_idx), True)
+        child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+
+        parent.addChild(child)
+
+    def get_profile_label_for_loss(self, run, file_idx, profile_idx):
+        try:
+            profile = run.file_list[file_idx][profile_idx]
+
+            if isinstance(profile, dict):
+                file_num = str(profile.get('file_num', profile_idx + 1))
+                prefix = "Profile " if "rofile" not in file_num else ""
+                return prefix + file_num
+
+        except Exception:
+            pass
+
+        try:
+            label = run.loss_x_vals[file_idx][profile_idx]
+            return str(label)
+        except Exception:
+            pass
+
+        return f"Profile {profile_idx + 1}"
+    
+
+    def make_loss_file_move_widget(self, file_idx, row, n_files):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        up_btn = QPushButton("↑")
+        down_btn = QPushButton("↓")
+
+        up_btn.setFixedWidth(28)
+        down_btn.setFixedWidth(28)
+
+        up_btn.setEnabled(row > 0)
+        down_btn.setEnabled(row < n_files - 1)
+
+        up_btn.clicked.connect(
+            lambda _, idx=file_idx: self.move_loss_file(idx, -1)
+        )
+        down_btn.clicked.connect(
+            lambda _, idx=file_idx: self.move_loss_file(idx, 1)
+        )
+
+        layout.addWidget(up_btn)
+        layout.addWidget(down_btn)
+
+        return widget
 
 
     def get_file_display_name_for_loss(self, file_idx):
@@ -537,154 +623,361 @@ class MainWindow(QWidget):
             if first_done is not None:
                 return first_done["file_key"][0]
 
-        elif file_item is not None:
-            return file_item["file_key"][0]
-
         return f"File {file_idx + 1}"
     
-    def set_loss_file_checked(self, file_idx, state):
-        self.active_run.loss_file_checked[file_idx] = state == Qt.Checked
-        self.update_multi_file_loss_plot_from_list()
-    
-    def populate_loss_file_list_widget(self):
-        self.loss_file_list_widget.clear()
-
-        for row, file_idx in enumerate(self.active_run.loss_file_order):
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, file_idx)
-
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(4, 2, 4, 2)
-
-            checkbox = QCheckBox(self.get_file_display_name_for_loss(file_idx))
-            checkbox.setChecked(self.active_run.loss_file_checked.get(file_idx, True))
-
-            up_btn = QPushButton("↑")
-            down_btn = QPushButton("↓")
-
-            up_btn.setFixedWidth(32)
-            down_btn.setFixedWidth(32)
-
-            up_btn.setEnabled(row > 0)
-            down_btn.setEnabled(row < len(self.active_run.loss_file_order) - 1)
-
-            checkbox.stateChanged.connect(
-                lambda state, idx=file_idx: self.set_loss_file_checked(idx, state)
-            )
-
-            up_btn.clicked.connect(
-                lambda checked=False, idx=file_idx: self.move_loss_file(idx, -1)
-            )
-
-            down_btn.clicked.connect(
-                lambda checked=False, idx=file_idx: self.move_loss_file(idx, 1)
-            )
-
-            row_layout.addWidget(checkbox)
-            row_layout.addStretch()
-            row_layout.addWidget(up_btn)
-            row_layout.addWidget(down_btn)
-
-            item.setSizeHint(row_widget.sizeHint())
-
-            self.loss_file_list_widget.addItem(item)
-            self.loss_file_list_widget.setItemWidget(item, row_widget)
 
     def move_loss_file(self, file_idx, direction):
-        """
-        direction = -1 moves up
-        direction =  1 moves down
-        """
-
-        if file_idx not in self.active_run.loss_file_order:
-            return
-
-        old_pos = self.active_run.loss_file_order.index(file_idx)
-        new_pos = old_pos + direction
-
-        if new_pos < 0 or new_pos >= len(self.active_run.loss_file_order):
-            return
-
-        self.active_run.loss_file_order[old_pos], self.active_run.loss_file_order[new_pos] = (
-            self.active_run.loss_file_order[new_pos],
-            self.active_run.loss_file_order[old_pos],
-        )
-
-        self.populate_loss_file_list_widget()
-        self.update_multi_file_loss_plot_from_list()
-
-
-    def update_multi_file_loss_plot_from_list(self):
         run = self.active_run
         if run is None:
             return
 
-        if not hasattr(self, "loss_plot_layout"):
+        if file_idx not in run.loss_file_order:
             return
 
-        selected_file_indices = [
-            file_idx
-            for file_idx in run.loss_file_order
-            if run.loss_file_checked.get(file_idx, True)
-        ]
+        old_pos = run.loss_file_order.index(file_idx)
+        new_pos = old_pos + direction
 
-        fig = self.make_multi_file_loss_fig(selected_file_indices, run=run)
+        if new_pos < 0 or new_pos >= len(run.loss_file_order):
+            return
 
-        self.clear_layout_delete(self.loss_plot_layout)
+        # Update persistent order.
+        run.loss_file_order[old_pos], run.loss_file_order[new_pos] = (
+            run.loss_file_order[new_pos],
+            run.loss_file_order[old_pos],
+        )
 
-        canvas = FigureCanvas(fig)
-        self.loss_plot_layout.addWidget(canvas)
-    
+        # Move the existing top-level QTreeWidgetItem instead of rebuilding.
+        self.updating_loss_tree = True
+        blocker = QSignalBlocker(self.loss_tree)
 
-    def make_multi_file_loss_fig(self, selected_file_indices, run=None):
+        item = self.loss_tree.takeTopLevelItem(old_pos)
+        self.loss_tree.insertTopLevelItem(new_pos, item)
+
+        del blocker
+        self.updating_loss_tree = False
+
+        # Rebuild only the move-button widgets because first/last enabled states changed.
+        self.refresh_loss_tree_move_buttons()
+
+        # Keep moved item selected/visible.
+        self.loss_tree.setCurrentItem(item)
+        self.loss_tree.scrollToItem(item)
+
+        self.update_loss_plot_from_tree()
+
+    def refresh_loss_tree_move_buttons(self):
+        run = self.active_run
+        if run is None or not hasattr(self, "loss_tree"):
+            return
+
+        n_files = self.loss_tree.topLevelItemCount()
+
+        for row in range(n_files):
+            item = self.loss_tree.topLevelItem(row)
+            data = item.data(0, Qt.UserRole)
+
+            if not data:
+                continue
+
+            file_idx = data["file_idx"]
+
+            # Remove old widget, then install a new one with correct enabled states.
+            old_widget = self.loss_tree.itemWidget(item, 1)
+            if old_widget is not None:
+                self.loss_tree.removeItemWidget(item, 1)
+                old_widget.deleteLater()
+
+            if n_files > 1:
+                move_widget = self.make_loss_file_move_widget(file_idx, row, n_files)
+                self.loss_tree.setItemWidget(item, 1, move_widget)
+
+    def on_loss_tree_item_changed(self, item, column):
+        if column != 0:
+            return
+
+        if getattr(self, "updating_loss_tree", False):
+            return
+
+        run = self.active_run
         if run is None:
-            run = self.active_run
+            return
 
-        fig = Figure(figsize=(9, 5))
-        ax = fig.add_subplot(111)
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+
+        kind = data["kind"]
+        file_idx = data["file_idx"]
+        profile_idx = data["profile_idx"]
+
+        state = item.checkState(0)
+
+        if kind == "file":
+            checked = state == Qt.Checked
+
+            child_state = Qt.Checked if checked else Qt.Unchecked
+
+            self.updating_loss_tree = True
+            blocker = QSignalBlocker(self.loss_tree)
+
+            for i in range(item.childCount()):
+                child = item.child(i)
+                child_data = child.data(0, Qt.UserRole)
+
+                child.setCheckState(0, child_state)
+
+                if child_data:
+                    c_file_idx = child_data["file_idx"]
+                    c_profile_idx = child_data["profile_idx"]
+                    run.loss_profile_checked[(c_file_idx, c_profile_idx)] = checked
+
+            # If parent checked, all children are checked.
+            # If parent unchecked, all children are unchecked.
+            run.first_unchecked_child[file_idx] = None if checked else 0
+
+            del blocker
+            self.updating_loss_tree = False
+
+        elif kind == "profile":
+            checked = state == Qt.Checked
+            run.loss_profile_checked[(file_idx, profile_idx)] = checked
+
+            parent = item.parent()
+            if parent is not None:
+                parent_data = parent.data(0, Qt.UserRole)
+
+                if parent_data:
+                    parent_file_idx = parent_data["file_idx"]
+                    self.update_parent_check_state(parent, parent_file_idx)
+
+
+        self.update_loss_plot_from_tree()
+
+    def update_parent_check_state(self, parent, file_idx):
+        if parent.childCount() == 0:
+            return
+
+        run = self.active_run
+        if run is None:
+            return
+
+        remembered_child = run.first_unchecked_child.get(file_idx)
+
+        parent_should_be_checked = True
+
+        # Fast path: remembered unchecked child is still unchecked.
+        if remembered_child is not None and remembered_child < parent.childCount():
+            if parent.child(remembered_child).checkState(0) == Qt.Unchecked:
+                parent_should_be_checked = False
+            else:
+                remembered_child = None
+
+        # Slow path: only scan if no known unchecked child.
+        if remembered_child is None:
+            for i in range(parent.childCount()):
+                if parent.child(i).checkState(0) == Qt.Unchecked:
+                    run.first_unchecked_child[file_idx] = i
+                    parent_should_be_checked = False
+                    break
+            else:
+                run.first_unchecked_child[file_idx] = None
+                parent_should_be_checked = True
+
+        new_state = Qt.Checked if parent_should_be_checked else Qt.Unchecked
+
+        if parent.checkState(0) != new_state:
+            blocker = QSignalBlocker(self.loss_tree)
+            parent.setCheckState(0, new_state)
+            del blocker
+        
+
+    def on_loss_tree_item_expanded(self, item):
+        run = self.active_run
+        if run is None:
+            return
+
+        data = item.data(0, Qt.UserRole)
+        if data and data["kind"] == "file":
+            run.loss_expanded_files.add(data["file_idx"])
+
+
+    def on_loss_tree_item_collapsed(self, item):
+        run = self.active_run
+        if run is None:
+            return
+
+        data = item.data(0, Qt.UserRole)
+        if data and data["kind"] == "file":
+            run.loss_expanded_files.discard(data["file_idx"])
+
+
+    def get_selected_loss_plot_data(self):
+        run = self.active_run
 
         if run is None:
-            ax.text(
-                0.5, 0.5,
-                "No active run",
-                ha="center",
-                va="center",
-                transform=ax.transAxes
-            )
-            return fig
+            return [], [], []
 
         x_vals = []
         y_vals = []
+        hover_labels = []
 
-        for file_idx in selected_file_indices:
-            y_vals.extend(run.loss_graph_vals[file_idx])
-            x_vals.extend(run.loss_x_vals[file_idx])
+        x = 1
 
-            # for loss_idx in range(len(file_losses)):
-            #     loss = file_losses[loss_idx]
-            #     x_vals.append("Profile " + run.file_list[file_idx][loss_idx]['file_num'])
-            #     y_vals.append(loss)
+        for file_idx in run.loss_file_order:
+
+            file_name = self.get_file_display_name_for_loss(file_idx)
+
+            for profile_idx, loss in enumerate(run.loss_graph_vals[file_idx]):
+                if not run.loss_profile_checked.get((file_idx, profile_idx), True):
+                    continue
+
+                if loss is None:
+                    continue
+
+                profile_label = self.get_profile_label_for_loss(
+                    run,
+                    file_idx,
+                    profile_idx
+                )
+
+                x_vals.append(x)
+                y_vals.append(float(loss))
+                hover_labels.append(
+                    f"{file_name}\n{profile_label}\nx = {x}\nloss = {float(loss):.6g}"
+                )
+                x += 1
+
+        return x_vals, y_vals, hover_labels
+    
+
+    def update_loss_plot_from_tree(self):
+        if not hasattr(self, "loss_ax") or not hasattr(self, "loss_canvas"):
+            return
+
+        x_vals, y_vals, hover_labels = self.get_selected_loss_plot_data()
+
+        ax = self.loss_ax
+        ax.clear()
 
         if x_vals:
-            ax.plot(x_vals, y_vals, marker="o")
+            line, = ax.plot(x_vals, y_vals, marker="o", linestyle="-", picker=5)
+
+            self.loss_hover_data = {
+                "x": x_vals,
+                "y": y_vals,
+                "labels": hover_labels,
+            }
+
+            self.configure_loss_hover_matplotlib()
         else:
             ax.text(
-                0.5, 0.5,
-                "No completed profile losses yet",
+                0.5,
+                0.5,
+                "No selected completed profile losses",
                 ha="center",
                 va="center",
                 transform=ax.transAxes
             )
+            self.loss_hover_data = None
 
-        ax.tick_params(axis='x', labelrotation=90)
-        ax.set_title("Final Loss by Selected Files", fontdict={'size': 40})
-        ax.set_xlabel("Profiles in selected file order", fontdict={'size': 28})
-        ax.set_ylabel("Final Loss", fontdict={'size': 28})
+        self.format_loss_axis(ax, x_vals)
+
+        self.loss_fig.tight_layout()
+        self.loss_canvas.draw_idle()
+
+
+    def format_loss_axis(self, ax, x_vals):
+        ax.set_title("Final Loss by Selected Profiles")
+        ax.set_xlabel("Selected profile index")
+        ax.set_ylabel("Final Loss")
         ax.grid(True)
 
-        fig.tight_layout()
-        return fig
+        if not x_vals:
+            return
+
+        n = len(x_vals)
+
+        if n <= 30:
+            step = 1
+        elif n <= 100:
+            step = 5
+        elif n <= 500:
+            step = 25
+        elif n <= 2000:
+            step = 100
+        else:
+            step = 250
+
+        ticks = list(range(1, n + 1, step))
+
+        if ticks[-1] != n:
+            ticks.append(n)
+
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([str(t) for t in ticks])
+
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=12, integer=True))
+
+
+    def configure_loss_hover_matplotlib(self):
+        if not hasattr(self, "loss_canvas"):
+            return
+
+        if self.loss_hover_annotation is None:
+            self.loss_hover_annotation = self.loss_ax.annotate(
+                "",
+                xy=(0, 0),
+                xytext=(15, 15),
+                textcoords="offset points",
+                bbox=dict(boxstyle="round", fc="w"),
+                arrowprops=dict(arrowstyle="->")
+            )
+            self.loss_hover_annotation.set_visible(False)
+
+        if not getattr(self, "loss_hover_connected", False):
+            self.loss_hover_connected = True
+            self.loss_canvas.mpl_connect("motion_notify_event", self.on_loss_hover)
+
+    def on_loss_hover(self, event):
+        if event.inaxes != getattr(self, "loss_ax", None):
+            return
+
+        data = getattr(self, "loss_hover_data", None)
+
+        if not data:
+            return
+
+        x_vals = data["x"]
+        y_vals = data["y"]
+        labels = data["labels"]
+
+        if not x_vals or event.xdata is None or event.ydata is None:
+            return
+
+        idx = int(round(event.xdata)) - 1
+
+        if idx < 0 or idx >= len(x_vals):
+            self.hide_loss_hover()
+            return
+
+        x = x_vals[idx]
+        y = y_vals[idx]
+
+        y_range = max(y_vals) - min(y_vals) if len(y_vals) > 1 else 1.0
+
+        if abs(event.ydata - y) > 0.05 * y_range:
+            self.hide_loss_hover()
+            return
+
+        self.loss_hover_annotation.xy = (x, y)
+        self.loss_hover_annotation.set_text(labels[idx])
+        self.loss_hover_annotation.set_visible(True)
+        self.loss_canvas.draw_idle()
+
+    def hide_loss_hover(self):
+        if self.loss_hover_annotation is not None and self.loss_hover_annotation.get_visible():
+            self.loss_hover_annotation.set_visible(False)
+            self.loss_canvas.draw_idle()
 
 
     def open_map_view(self):
@@ -1607,15 +1900,19 @@ class MainWindow(QWidget):
 
     def read_txt(self, is_file, folder, num_files, folder_name, run):
         test_file = self.curr_path if is_file else next(self.curr_path.iterdir())
+        print("FOLDER NAME ", folder_name)
 
         cols_data = self.get_txt_cols(test_file)
         if cols_data is None:
             return None, None
 
         cols, new_names, prof_id, delim, header = cols_data[0], cols_data[1], cols_data[2], cols_data[3], cols_data[4]
-        self.num_profs[folder_name] = 0
         single_prof_count = 0
         n_profs_counts = []
+
+        if prof_id == "None" and not run.loss_x_vals:
+            run.loss_x_vals.append([])
+            run.file_names.append(folder_name)
 
         jobs = []
         i = 0
@@ -1627,12 +1924,13 @@ class MainWindow(QWidget):
 
             # Single Profile in File
             if prof_id == "None":
-                run.loss_x_vals.append(file_name)
+                run.loss_x_vals[0].append(file_name)
                 coords = self.process_locations(df.iloc[0], i) if self.loc_format else None
                 jobs.append({'df': str(file),
                              'file_num': file_name, 
-                             'coords': coords, 
-                             'file_key': (file_name, single_prof_count, None),
+                             'coords': coords,
+                             'prof_id': False,
+                             'file_key': (folder_name, single_prof_count, 0),
                              'file_info': (file, None)})
                 single_prof_count += 1
                 
@@ -1642,33 +1940,35 @@ class MainWindow(QWidget):
                 num_ids = len(profile_ids)
                 n_profs_counts.append(num_ids)
                 run.loss_x_vals.append([])
+                run.file_names.append(file_name)
 
                 for id_idx in range(num_ids):
-                    run.loss_x_vals[-1].append("Profile " + curr_prof_id)
                     curr_prof_id = profile_ids[id_idx]
+                    run.loss_x_vals[-1].append("Profile " + str(curr_prof_id))
                     orig_prof = profiles.get_group(curr_prof_id)
                     coords = self.process_locations(orig_prof.iloc[0], curr_prof_id) if self.loc_format else None
                     jobs.append({'df': str(file), 
-                                 'file_num': curr_prof_id, 
-                                 'coords': coords, 
+                                 'file_num': str(curr_prof_id), 
+                                 'coords': coords,
+                                 'prof_id': True,
                                  'file_key': (file_name, id_idx, i), #file_name, profile index, file index
                                  'file_info': (file, curr_prof_id)})
  
 
             i += 1
 
-        run.file_list = single_prof_count*[None]
-        run.disp_graph_vals = single_prof_count*[None]
-        run.loss_graph_vals = single_prof_count*[None]
+        if prof_id == "None":
+            n_profs_counts.append(single_prof_count)
+
         t = 0
         for count in n_profs_counts:
             t += count
             run.file_list.append(count*[None])
             run.disp_graph_vals.append(count*[None])
             run.loss_graph_vals.append(count*[None])
+            run.completed_vals.append(0)
 
-        run.total_profiles = num_files if prof_id == "None" else t
-        #self.progress_bar.setMaximum(total_profs_num)
+        run.total_profiles = t
 
         return jobs, cols_data
 
@@ -1679,6 +1979,8 @@ class MainWindow(QWidget):
         if subset is None:
             return None
         
+        run.file_names.extend(file_names)
+        
         jobs = []
         for curr_file_i in range(n_files):
             f_path = folder[curr_file_i]
@@ -1687,7 +1989,6 @@ class MainWindow(QWidget):
 
             groups = [f[k] for k in file_keys]
             prof_keys = list(groups[0].keys())
-            run.disp_graph_vals = [[] for _ in range(len(groups))]
             run.loss_x_vals.append([])
 
             if isinstance(subset, list) and subset[curr_file_i] != "":
@@ -1723,14 +2024,15 @@ class MainWindow(QWidget):
             else:
                 keys = range(len(prof_keys))
             
-            run.total_profiles = len(keys)
-            #self.progress_bar.setMaximum(len(keys))
+            run.total_profiles += len(keys)
 
-            file_name, _ = self.get_path_name(f_path)
+            file_name = file_names[curr_file_i]
 
             run.file_list.append(len(keys)*[None])
-            run.disp_graph_vals.append(len(keys)*[None])
+            # run.disp_graph_vals = [[] for _ in range(len(groups))]
+            # run.disp_graph_vals.append(len(keys)*[None])
             run.loss_graph_vals.append(len(keys)*[None])
+            run.completed_vals.append(0)
             profile_list_idx = 0
             for k in keys:
                 key = prof_keys[k]
@@ -1844,33 +2146,16 @@ class MainWindow(QWidget):
         flat = []
         losses = []
         for file_idx, item in enumerate(run.loss_graph_vals):
-
-            # Multi-profile file
-            if isinstance(item, list):
-                for profile_idx, loss in enumerate(item):
-                    if loss is None:
-                        continue
-
-                    flat.append({
-                        "file_idx": file_idx,
-                        "profile_idx": profile_idx,
-                        "loss": float(loss),
-                    })
-                    losses.append(float(loss))
-                    if profile_idx == 10:
-                        losses[-1] = 0.6
-
-            # Single-profile file
-            else:
-                if item is None:
+            for profile_idx, loss in enumerate(item):
+                if loss is None:
                     continue
 
                 flat.append({
                     "file_idx": file_idx,
-                    "profile_idx": None,
-                    "loss": float(item),
+                    "profile_idx": profile_idx,
+                    "loss": float(loss),
                 })
-                losses.append(float(item))
+                losses.append(float(loss))
 
         if len(flat) <= 20:
             return set(), set()
@@ -1909,17 +2194,18 @@ class MainWindow(QWidget):
                 high_loss_profs.add((row["file_idx"], row["profile_idx"]))
                 high_loss_files.add(row["file_idx"])
 
+        if hasattr(self, "selector_model"):
         #The model needs access to the latest flag sets.
-        self.selector_model.high_loss_files = high_loss_files
-        self.selector_model.high_loss_profiles = high_loss_profs
+            self.selector_model.high_loss_files = high_loss_files
+            self.selector_model.high_loss_profiles = high_loss_profs
 
-        top_left = self.selector_model.index(0, 0)
-        bottom_right = self.selector_model.index(
-            max(0, self.selector_model.rowCount() - 1),
-            0
-        )
+            top_left = self.selector_model.index(0, 0)
+            bottom_right = self.selector_model.index(
+                max(0, self.selector_model.rowCount() - 1),
+                0
+            )
 
-        self.selector_model.dataChanged.emit(top_left, bottom_right)
+            self.selector_model.dataChanged.emit(top_left, bottom_right)
 
         return high_loss_files, high_loss_profs
 
@@ -1987,8 +2273,6 @@ class MainWindow(QWidget):
 
 
     def on_profile_progress_for_run(self, run, completed):
-        run.completed_profiles = completed
-
         # Only update the visible progress bar if this is the displayed run.
         if self.active_run is run:
             self.progress_bar.setValue(completed)
@@ -1997,14 +2281,10 @@ class MainWindow(QWidget):
     def on_profile_result_ready_for_run(self, run, r):
         _, prof_idx, file_idx = r["file_key"]
 
-        if file_idx is None:
-            run.file_list[prof_idx] = r
-            run.loss_graph_vals[prof_idx] = r["final_loss"]
-            nav_key = (prof_idx, None)
-        else:
-            run.file_list[file_idx][prof_idx] = r
-            run.loss_graph_vals[file_idx][prof_idx] = r["final_loss"]
-            nav_key = (file_idx, prof_idx)
+        run.file_list[file_idx][prof_idx] = r
+        run.loss_graph_vals[file_idx][prof_idx] = r["final_loss"]
+        run.completed_vals[file_idx] += 1
+        nav_key = (file_idx, prof_idx)
 
         flat_idx = run.profile_nav_lookup.get(nav_key)
         if flat_idx is not None:
@@ -2057,7 +2337,8 @@ class MainWindow(QWidget):
                 pass
 
             self.shutdown_label.hide()
-            self.refresh_file_selector_after_result()
+            if hasattr(self, "selector_model") and hasattr(self, "main_stack"):
+                self.refresh_file_selector_after_result()
 
             if hasattr(self, "losses_tab") and self.losses_tab is not None:
                 self.build_losses_tab()
@@ -2067,11 +2348,50 @@ class MainWindow(QWidget):
         if not hasattr(self, "results_tabs") or self.results_tabs is None:
             return
 
-        # Only refresh live if the user is currently viewing the Losses tab.
         if self.results_tabs.currentWidget() != self.losses_tab:
             return
 
-        self.build_losses_tab()
+        # Do not rebuild the whole tab.
+        # Just update labels/check states if needed and redraw the plot.
+        if hasattr(self, "loss_tree"):
+            self.refresh_loss_tree_labels_only()
+
+        self.update_loss_plot_from_tree()
+
+    def refresh_loss_tree_labels_only(self):
+        run = self.active_run
+        if run is None or not hasattr(self, "loss_tree"):
+            return
+
+        self.updating_loss_tree = True
+
+        for i in range(self.loss_tree.topLevelItemCount()):
+            parent = self.loss_tree.topLevelItem(i)
+            data = parent.data(0, Qt.UserRole)
+
+            if not data:
+                continue
+
+            file_idx = data["file_idx"]
+            file_name = self.get_file_display_name_for_loss(file_idx)
+            #completed = self.count_completed_losses_for_file(run, file_idx)
+            completed = run.completed_vals[file_idx]
+            total = len(run.loss_graph_vals[file_idx])
+
+            parent.setText(0, f"{file_name}  ({completed}/{total} complete)")
+
+            for profile_idx in range(parent.childCount()):
+                child = parent.child(profile_idx)
+                label = self.get_profile_label_for_loss(run, file_idx, profile_idx)
+
+                if run.loss_graph_vals[file_idx][profile_idx] is None:
+                    label += "  Processing..."
+
+                child.setText(0, label)
+
+            self.update_parent_check_state(parent, file_idx)
+
+        self.updating_loss_tree = False
 
     def refresh_file_selector_after_result(self, r=None):
         """
@@ -2080,6 +2400,15 @@ class MainWindow(QWidget):
         This does not force the user back to the file selector.
         It only rebuilds the model for the selector page the user is currently viewing.
         """
+
+        if self.active_run is None:
+            return
+
+        # if not hasattr(self, "selector_model"):
+        #     return
+
+        # if not hasattr(self, "main_stack"):
+        #     return
 
         view_state = getattr(self, "selector_mode", "files")
 
@@ -2092,6 +2421,7 @@ class MainWindow(QWidget):
         if view_state == "files":
             self.selector_model.set_items(
                 self.active_run.file_list,
+                self.active_run.completed_vals,
                 mode="files"
             )
             return
@@ -2099,6 +2429,8 @@ class MainWindow(QWidget):
         # User is looking at the profile list for one multi-profile file.
         if view_state == "profiles":
             current_file_idx = getattr(self, "current_file_idx", None)
+            if current_file_idx is None:
+                return
 
             # Only refresh this list if the newly finished result belongs to
             # the file currently being viewed.
@@ -2153,7 +2485,7 @@ class MainWindow(QWidget):
         self.selector_view.setUniformItemSizes(True)
         self.selector_view.setSpacing(2)
 
-        self.selector_model = SelectorListModel([], mode="files", parent=self)
+        self.selector_model = SelectorListModel([],self.active_run.file_names, [], mode="files", parent=self)
         self.selector_view.setModel(self.selector_model)
 
         self.selector_view.setStyleSheet("""
@@ -2210,26 +2542,31 @@ class MainWindow(QWidget):
 
 
     def show_file_selector(self):
+        if self.selector_mode == "profiles":
+            self.proc_panel_title.setText("SELECT FILE/FOLDER")
+        else:
+            self.clear_layout_detach(self.processing_panel)
+            self.processing_panel.addWidget(self.proc_panel_title)
+            self.processing_panel.addWidget(self.title_line)
+            self.processing_panel.setAlignment(Qt.AlignTop)
+            self.processing_panel.addStretch()
+            self.proc_panel_title.setText("SELECT FILE/FOLDER")
+
         self.selector_mode = "files"
         self.current_file_idx = None
 
         if self.active_run is None:
             return
 
-        self.clear_layout_detach(self.processing_panel)
-        self.processing_panel.addWidget(self.proc_panel_title)
-        self.processing_panel.addWidget(self.title_line)
-        self.processing_panel.setAlignment(Qt.AlignTop)
-        self.processing_panel.addStretch()
-
-        self.proc_panel_title.setText("SELECT PROFILE")
-
-        self.proc_panel_title.setText("SELECT FILE")
-
         self.selector_model.current_file_idx = None
         self.selector_model.high_loss_files = self.active_run.high_loss_files
         self.selector_model.high_loss_profiles = self.active_run.high_loss_profiles
-        self.selector_model.set_items(self.active_run.file_list, mode="files")
+
+        self.selector_model.set_items(
+            self.active_run.file_list,
+            self.active_run.completed_vals,
+            mode="files"
+        )
 
         self.main_stack.setCurrentWidget(self.selector_page)
         self.selector_view.show()
@@ -2244,10 +2581,12 @@ class MainWindow(QWidget):
             if file_item is None:
                 return
 
-            if isinstance(file_item, list):
-                self.show_profile_selector(file_idx)
-            else:
-                self.display_profile(file_idx, None)
+            self.show_profile_selector(file_idx)
+
+            # if isinstance(file_item, list):
+            #     self.show_profile_selector(file_idx)
+            # else:
+            #     self.display_profile(file_idx, None)
 
         elif self.selector_mode == "profiles":
             profile_idx = row
@@ -2260,24 +2599,30 @@ class MainWindow(QWidget):
 
 
     def show_profile_selector(self, file_idx):
+        if self.selector_mode == "result":
+            self.clear_layout_detach(self.processing_panel)
+            self.processing_panel.addWidget(self.proc_panel_title)
+            self.processing_panel.addWidget(self.title_line)
+            self.processing_panel.setAlignment(Qt.AlignTop)
+            self.processing_panel.addStretch()
+            self.proc_panel_title.setText("SELECT PROFILE")
+        elif self.selector_mode == "files":
+            self.proc_panel_title.setText("SELECT PROFILE")
+
         self.selector_mode = "profiles"
         self.current_file_idx = file_idx
 
         self.selector_model.current_file_idx = file_idx
         self.selector_model.high_loss_files = self.active_run.high_loss_files
         self.selector_model.high_loss_profiles = self.active_run.high_loss_profiles
-        self.selector_model.set_items(self.active_run.file_list[file_idx], mode="profiles")
+
+        self.selector_model.set_items(
+            self.active_run.file_list[file_idx],
+            mode="profiles"
+        )
 
         self.main_stack.setCurrentWidget(self.selector_page)
         self.selector_view.show()
-
-        self.clear_layout_detach(self.processing_panel)
-        self.processing_panel.addWidget(self.proc_panel_title)
-        self.processing_panel.addWidget(self.title_line)
-        self.processing_panel.setAlignment(Qt.AlignTop)
-        self.processing_panel.addStretch()
-
-        self.proc_panel_title.setText("SELECT PROFILE")       
 
         back_btn = QPushButton("Back")
         back_btn.clicked.connect(self.show_file_selector)
@@ -2399,10 +2744,7 @@ class MainWindow(QWidget):
 
 
     def build_profile_view(self, file_index, profile_index, flag=False):
-        if profile_index is None:
-            profile = self.active_run.file_list[file_index]
-        else:
-            profile = self.active_run.file_list[file_index][profile_index]
+        profile = self.active_run.file_list[file_index][profile_index]
 
         fig_path, df, u, fig_loss_path = profile['fig'], profile['table'], profile['uncert'], profile['losses']
         file_info = profile['file_info']
@@ -2457,39 +2799,6 @@ class MainWindow(QWidget):
         plot_history_button.clicked.connect(lambda: self.show_fit_history(tabs, file_info))
 
         return table, tabs, plot_history_button
-
-
-    def quick_eval_old(self, file_info):
-        file_path, file_ID = file_info
-        file = Path(file_path)
-
-        if file.suffix == '.h5':
-            pass
-        else:
-            data = pd.read_csv(file, delimiter=self.delim, header=self.header)
-            df = (data[self.cols].rename(columns=self.new_names) if file_ID is None 
-                  else data[self.cols].rename(columns=self.new_names).groupby(self.ids).get_group(file_ID))
-
-            return self.eval_data(df, file_ID, history=True)
-
-    
-    def show_fit_history(self, tabs, file_info):
-        
-        model, losses, x_norm, y, scale_shift = self.quick_eval(file_info)
-
-        states = losses["states"]
-        model.eval()
-
-        anim_widget = fit_animation.FitHistoryWidget(
-            model=model,
-            states=states,
-            x_norm=x_norm,
-            y = y,
-            max_points=500
-        )
-
-        tabs.addTab(anim_widget, "Fit History Animation")
-        tabs.setCurrentWidget(anim_widget) 
         
     def show_profile_in_popup(self, file_index, profile_index):
         profile_window = QMainWindow()
