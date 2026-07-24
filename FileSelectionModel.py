@@ -14,11 +14,17 @@ class SelectorListModel(QAbstractListModel):
         self.high_loss_profiles = set()
         self.current_file_idx = None
 
-    def set_items(self, items, completed=None, mode=None):
+    def set_items(self, items, file_names=None, completed=None, mode=None):
         self.beginResetModel()
 
-        self.items = items
-        self.completed = completed
+        self.items = items if items is not None else []
+
+        if file_names is not None:
+            self.file_names = file_names
+
+        if completed is not None:
+            self.completed = completed
+        
         if mode is not None:
             self.mode = mode
 
@@ -34,10 +40,11 @@ class SelectorListModel(QAbstractListModel):
         row = index.row()
         item = self.items[row]
         prefix = "  "
-        completed = 0 if self.completed is None else self.completed[row]
 
         if role == Qt.DisplayRole:
             if self.mode == "files":
+                completed = 0 if self.completed is None else self.completed[row]
+
                 if row in self.high_loss_files:
                     prefix = "🔴 "
 

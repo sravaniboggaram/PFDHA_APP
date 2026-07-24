@@ -29,10 +29,15 @@ class ProfileMetricGraphWidget(QWidget):
         self.metric = metric
 
         self.updating_tree = False
+        print("XVALS ")
+        print(self.main_window.active_run.loss_x_vals)
 
         self.hover_data = None
         self.hover_annotation = None
         self.hover_connected = False
+
+        self.parent_items = {}
+        self.child_items = {}
 
         self.init_ui()
 
@@ -82,7 +87,7 @@ class ProfileMetricGraphWidget(QWidget):
     # Main refresh entry point
     # ------------------------------------------------------------------
 
-    def refresh(self, rebuild_tree=False):
+    def refresh(self, rebuild_tree=False, result=None):
         """
         Call this when:
         - active run changes
@@ -101,8 +106,12 @@ class ProfileMetricGraphWidget(QWidget):
 
         if rebuild_tree or self.tree.topLevelItemCount() == 0:
             self.populate_tree()
-        else:
-            self.refresh_tree_labels_only()
+            self.update_plot()
+            return
+        
+        if result is not None:
+            self.refresh_after_result(result)
+            return
 
         self.update_plot()
 
@@ -131,6 +140,13 @@ class ProfileMetricGraphWidget(QWidget):
 
     def get_run(self):
         return self.main_window.active_run
+    
+    def get_state(self):
+        run = self.get_run()
+        if run is None:
+            return None
+
+        return run.metric_graph_state[self.metric]
 
     def get_metric_vals(self):
         run = self.get_run()
@@ -171,48 +187,57 @@ class ProfileMetricGraphWidget(QWidget):
 
     def init_tree_state(self):
         run = self.get_run()
+        state = self.get_state()
         vals = self.get_metric_vals()
 
-        if run is None:
+        if run is None or state is None:
             return
 
         n_files = len(vals)
 
-        if len(run.loss_file_order) != n_files:
-            run.loss_file_order = list(range(n_files))
+        if len(state.file_order) != n_files:
+            state.file_order = list(range(n_files))
 
-        for file_idx in run.loss_file_order:
-            if file_idx not in run.loss_file_checked:
-                run.loss_file_checked[file_idx] = True
+        for file_idx in state.file_order:
+            if file_idx not in state.file_checked:
+                state.file_checked[file_idx] = True
 
-            if file_idx not in run.first_unchecked_child:
-                run.first_unchecked_child[file_idx] = None
+            if file_idx not in state.first_unchecked_child:
+                state.first_unchecked_child[file_idx] = None
 
-        for file_idx, file_vals in enumerate(vals):
-            for profile_idx in range(len(file_vals)):
-                key = (file_idx, profile_idx)
-                if key not in run.loss_profile_checked:
-                    run.loss_profile_checked[key] = True
+        state.file_checked = {
+            file_idx: checked
+            for file_idx, checked in state.file_checked.items()
+            if file_idx in state.file_order
+        }
+
+        # for file_idx, file_vals in enumerate(vals):
+        #     for profile_idx in range(len(file_vals)):
+        #         key = (file_idx, profile_idx)
+        #         if key not in state.profile_checked:
+        #             state.profile_checked[key] = True
 
     def populate_tree(self):
         run = self.get_run()
-        vals = self.get_metric_vals()
+        state = self.get_state()
 
-        if run is None:
+        if run is None or state is None:
             return
 
         self.init_tree_state()
 
         self.updating_tree = True
         self.tree.clear()
+        self.parent_items.clear()
+        self.child_items.clear()
 
-        n_files = len(run.loss_file_order)
+        n_files = len(state.file_order)
 
-        for row, file_idx in enumerate(run.loss_file_order):
+        for row, file_idx in enumerate(state.file_order):
             file_item = run.file_list[file_idx]
             file_name = self.get_file_display_name(file_idx)
 
-            completed = run.completed_vals[file_idx] if file_idx < len(run.completed_vals) else 0
+            completed = run.completed_vals[file_idx]
             total = len(file_item)
 
             parent = QTreeWidgetItem([f"{file_name}  ({completed}/{total} complete)", ""])
@@ -230,6 +255,7 @@ class ProfileMetricGraphWidget(QWidget):
             )
 
             self.tree.addTopLevelItem(parent)
+            self.parent_items[file_idx] = parent
 
             if n_files > 1:
                 move_widget = self.make_move_widget(file_idx, row, n_files)
@@ -240,8 +266,89 @@ class ProfileMetricGraphWidget(QWidget):
 
             self.update_parent_check_state(parent, file_idx)
 
-            parent.setExpanded(file_idx in run.loss_expanded_files)
+            parent.setExpanded(file_idx in state.expanded_files)
 
+        self.updating_tree = False
+
+    def refresh_after_result(self, result):
+        """
+        Update only the tree row affected by one completed profile result.
+        Then redraw the plot.
+
+        result["file_key"] format:
+            (file_name, profile_idx, file_idx)
+        """
+        run = self.get_run()
+        vals = self.get_metric_vals()
+
+        if run is None or not vals:
+            return
+
+        try:
+            _, profile_idx, file_idx = result["file_key"]
+        except Exception:
+            # If result format is unexpected, fall back to full rebuild.
+            self.refresh(rebuild_tree=True)
+            return
+
+        self.refresh_profile_tree_item(file_idx, profile_idx)
+        self.refresh_parent_tree_item(file_idx)
+
+        self.update_plot()
+
+    def refresh_profile_tree_item(self, file_idx, profile_idx):
+        """
+        Update the label for a single profile row.
+        """
+        vals = self.get_metric_vals()
+
+        child = self.child_items.get((file_idx, profile_idx))
+
+        if child is None:
+            # Tree might not have this row yet.
+            # This should be rare if the tree was built from placeholders.
+            return
+
+        label = self.get_profile_label(file_idx, profile_idx)
+
+        try:
+            value = vals[file_idx][profile_idx]
+        except Exception:
+            value = None
+
+        if value is None:
+            label += "  Processing..."
+
+        self.updating_tree = True
+        child.setText(0, label)
+        self.updating_tree = False
+
+    def refresh_parent_tree_item(self, file_idx):
+        """
+        Update only the parent row text for one file/folder.
+        Uses run.completed_vals, so this stays O(1).
+        """
+        run = self.get_run()
+
+        if run is None:
+            return
+
+        parent = self.parent_items.get(file_idx)
+
+        if parent is None:
+            return
+
+        try:
+            file_item = run.file_list[file_idx]
+            file_name = self.get_file_display_name(file_idx)
+            completed = run.completed_vals[file_idx]
+            total = len(file_item)
+            text = f"{file_name}  ({completed}/{total} complete)"
+        except Exception:
+            text = self.get_file_display_name(file_idx)
+
+        self.updating_tree = True
+        parent.setText(0, text)
         self.updating_tree = False
 
     def refresh_tree_labels_only(self):
@@ -282,7 +389,7 @@ class ProfileMetricGraphWidget(QWidget):
         self.updating_tree = False
 
     def add_profile_child(self, parent, file_idx, profile_idx):
-        run = self.get_run()
+        state = self.get_state()
         vals = self.get_metric_vals()
 
         label = self.get_profile_label(file_idx, profile_idx)
@@ -305,10 +412,11 @@ class ProfileMetricGraphWidget(QWidget):
             | Qt.ItemIsSelectable
         )
 
-        checked = run.loss_profile_checked.get((file_idx, profile_idx), True)
+        checked = state.profile_checked.get((file_idx, profile_idx), True)
         child.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
 
         parent.addChild(child)
+        self.child_items[(file_idx, profile_idx)] = child
 
     # ------------------------------------------------------------------
     # Labels
@@ -383,22 +491,22 @@ class ProfileMetricGraphWidget(QWidget):
         return widget
 
     def move_file(self, file_idx, direction):
-        run = self.get_run()
-        if run is None:
+        state = self.get_state()
+        if state is None:
             return
 
-        if file_idx not in run.loss_file_order:
+        if file_idx not in state.file_order:
             return
 
-        old_pos = run.loss_file_order.index(file_idx)
+        old_pos = state.file_order.index(file_idx)
         new_pos = old_pos + direction
 
-        if new_pos < 0 or new_pos >= len(run.loss_file_order):
+        if new_pos < 0 or new_pos >= len(state.file_order):
             return
 
-        run.loss_file_order[old_pos], run.loss_file_order[new_pos] = (
-            run.loss_file_order[new_pos],
-            run.loss_file_order[old_pos],
+        state.file_order[old_pos], state.file_order[new_pos] = (
+            state.file_order[new_pos],
+            state.file_order[old_pos],
         )
 
         self.updating_tree = True
@@ -411,15 +519,14 @@ class ProfileMetricGraphWidget(QWidget):
         self.updating_tree = False
 
         self.refresh_move_buttons()
-
         self.tree.setCurrentItem(item)
         self.tree.scrollToItem(item)
 
         self.update_plot()
 
     def refresh_move_buttons(self):
-        run = self.get_run()
-        if run is None:
+        state = self.get_state()
+        if state is None:
             return
 
         n_files = self.tree.topLevelItemCount()
@@ -453,8 +560,8 @@ class ProfileMetricGraphWidget(QWidget):
         if self.updating_tree:
             return
 
-        run = self.get_run()
-        if run is None:
+        state = self.get_state()
+        if state is None:
             return
 
         data = item.data(0, Qt.UserRole)
@@ -465,10 +572,10 @@ class ProfileMetricGraphWidget(QWidget):
         file_idx = data["file_idx"]
         profile_idx = data["profile_idx"]
 
-        state = item.checkState(0)
+        check_state = item.checkState(0)
 
         if kind == "file":
-            checked = state == Qt.Checked
+            checked = check_state == Qt.Checked
             child_state = Qt.Checked if checked else Qt.Unchecked
 
             self.updating_tree = True
@@ -483,16 +590,16 @@ class ProfileMetricGraphWidget(QWidget):
                 if child_data:
                     c_file_idx = child_data["file_idx"]
                     c_profile_idx = child_data["profile_idx"]
-                    run.loss_profile_checked[(c_file_idx, c_profile_idx)] = checked
+                    state.profile_checked[(c_file_idx, c_profile_idx)] = checked
 
-            run.first_unchecked_child[file_idx] = None if checked else 0
+            state.first_unchecked_child[file_idx] = None if checked else 0
 
             del blocker
             self.updating_tree = False
 
         elif kind == "profile":
-            checked = state == Qt.Checked
-            run.loss_profile_checked[(file_idx, profile_idx)] = checked
+            checked = check_state == Qt.Checked
+            state.profile_checked[(file_idx, profile_idx)] = checked
 
             parent = item.parent()
             if parent is not None:
@@ -507,11 +614,11 @@ class ProfileMetricGraphWidget(QWidget):
         if parent.childCount() == 0:
             return
 
-        run = self.get_run()
-        if run is None:
+        state = self.get_state()
+        if state is None:
             return
 
-        remembered_child = run.first_unchecked_child.get(file_idx)
+        remembered_child = state.first_unchecked_child.get(file_idx)
 
         parent_should_be_checked = True
 
@@ -524,11 +631,11 @@ class ProfileMetricGraphWidget(QWidget):
         if remembered_child is None:
             for i in range(parent.childCount()):
                 if parent.child(i).checkState(0) == Qt.Unchecked:
-                    run.first_unchecked_child[file_idx] = i
+                    state.first_unchecked_child[file_idx] = i
                     parent_should_be_checked = False
                     break
             else:
-                run.first_unchecked_child[file_idx] = None
+                state.first_unchecked_child[file_idx] = None
                 parent_should_be_checked = True
 
         new_state = Qt.Checked if parent_should_be_checked else Qt.Unchecked
@@ -539,22 +646,23 @@ class ProfileMetricGraphWidget(QWidget):
             del blocker
 
     def on_item_expanded(self, item):
-        run = self.get_run()
-        if run is None:
+        state = self.get_state()
+        if state is None:
             return
 
         data = item.data(0, Qt.UserRole)
         if data and data["kind"] == "file":
-            run.loss_expanded_files.add(data["file_idx"])
+            state.expanded_files.add(data["file_idx"])
+
 
     def on_item_collapsed(self, item):
-        run = self.get_run()
-        if run is None:
+        state = self.get_state()
+        if state is None:
             return
 
         data = item.data(0, Qt.UserRole)
         if data and data["kind"] == "file":
-            run.loss_expanded_files.discard(data["file_idx"])
+            state.expanded_files.discard(data["file_idx"])
 
     # ------------------------------------------------------------------
     # Plot data
@@ -574,22 +682,21 @@ class ProfileMetricGraphWidget(QWidget):
 
     def get_selected_plot_data(self):
         run = self.get_run()
+        state = self.get_state()
         vals = self.get_metric_vals()
 
-        if run is None:
+        if run is None or state is None:
             return [], [], []
 
         x_vals = []
         y_series = []
         hover_labels = []
 
-        x = 1
-
-        for file_idx in run.loss_file_order:
+        for file_idx in state.file_order:
             file_name = self.get_file_display_name(file_idx)
 
             for profile_idx, value in enumerate(vals[file_idx]):
-                if not run.loss_profile_checked.get((file_idx, profile_idx), True):
+                if not state.profile_checked.get((file_idx, profile_idx), True):
                     continue
 
                 series_values = self.normalize_value_to_series(value)
@@ -612,13 +719,12 @@ class ProfileMetricGraphWidget(QWidget):
                         f"dim {i + 1} = {v:.6g}"
                         for i, v in enumerate(series_values)
                     )
-
+                x = run.loss_x_vals[file_idx][profile_idx]
                 x_vals.append(x)
                 hover_labels.append(
                     f"{file_name}\n{profile_label}\nx = {x}\n{value_text}"
                 )
 
-                x += 1
 
         return x_vals, y_series, hover_labels
 

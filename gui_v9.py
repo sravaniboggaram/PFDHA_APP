@@ -11,7 +11,7 @@ import torch
 import select_columns
 import select_h5_subset
 import create_azimuths
-from helper_funs import plot_disp_graph
+from helper_funs import extract_disp_by_dim
 from maps_functions import generate_google_maps_html, generate_leaflet_html
 from FileSelectionModel import SelectorListModel
 from PyQt5.QtWidgets import (
@@ -20,7 +20,6 @@ from PyQt5.QtWidgets import (
     QComboBox, QRadioButton, QButtonGroup, QDialog, QMessageBox, QTableWidget, 
     QTableWidgetItem, QTabWidget, QMainWindow, QSlider, QSplitter,
     QApplication, QCheckBox, QProgressBar, QListView, QStackedWidget,
-    QAbstractItemView, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -58,6 +57,15 @@ class EvalConfig:
 
 
 @dataclass
+class MetricGraphState:
+    file_order: list = field(default_factory=list)
+    file_checked: dict = field(default_factory=dict)
+    profile_checked: dict = field(default_factory=dict)
+    expanded_files: set = field(default_factory=set)
+    first_unchecked_child: dict = field(default_factory=dict)
+
+
+@dataclass
 class ProcessingRun:
     run_id: int
     name: str
@@ -78,19 +86,20 @@ class ProcessingRun:
     high_loss_files: set = field(default_factory=set)
     high_loss_profiles: set = field(default_factory=set)
 
-    loss_file_order: list = field(default_factory=list)
-    loss_file_checked: dict = field(default_factory=dict)
-    loss_profile_checked: dict = field(default_factory=dict)
-    loss_expanded_files: set = field(default_factory=set)
     loss_x_vals: list = field(default_factory=list)
-    first_unchecked_child: dict = field(default_factory=dict)
     file_names: list = field(default_factory=list)
+
+    metric_graph_state: dict = field(default_factory=lambda: {
+        "loss": MetricGraphState(),
+        "disp": MetricGraphState(),
+    })
 
     total_profiles: int = 0
     status: str = "created"
 
     selector_view_initialized: bool = False
     selector_mode: str = "files"
+    current_file_idx: int | None = None
     last_file_idx: int | None = None
     last_profile_idx: int | None = None
 
@@ -283,17 +292,16 @@ class MainWindow(QWidget):
         map_view_action.triggered.connect(self.open_map_view)
         tools_menu.addAction(map_view_action)
 
-        fitting = QAction("Adjust Fit", self)
-        fitting.triggered.connect(self.open_fitting_window)
-        tools_menu.addAction(fitting)
+        # fitting = QAction("Adjust Fit", self)
+        # fitting.triggered.connect(self.open_fitting_window)
+        # tools_menu.addAction(fitting)
 
         loss_graph = QAction("View Losses", self)
         loss_graph.triggered.connect(self.show_losses_tab)
         tools_menu.addAction(loss_graph)
 
         self.disp_graph_action = QAction("Displacement Graph", self)
-        self.disp_graph_action.setEnabled(False)
-        self.disp_graph_action.triggered.connect(self.show_displacement_tab)
+        self.disp_graph_action.triggered.connect(self.show_disp_tab)
         tools_menu.addAction(self.disp_graph_action)
 
         menu_bar.addMenu(file_menu)
@@ -393,7 +401,7 @@ class MainWindow(QWidget):
             self.show_results_tabs("DISP")
 
         self.disp_graph_widget.refresh(rebuild_tree=True)
-        self.results_tabs.setCurrentWidget(self.loss_graph_widget)
+        self.results_tabs.setCurrentWidget(self.disp_graph_widget)
     
 
     def show_results_tabs(self, metric):
@@ -418,9 +426,10 @@ class MainWindow(QWidget):
         if metric == "LOSS":
             self.loss_graph_widget = ProfileMetricGraphWidget(self, metric="loss")
             self.results_tabs.addTab(self.loss_graph_widget, "Losses")
-        elif self.metric == "DISP":
+        elif metric == "DISP":
+            print("entered")
             self.disp_graph_widget = ProfileMetricGraphWidget(self, metric="disp")
-            self.results_tabs.addTab(self.disp_graph_widget, "Displacement")
+            self.results_tabs.addTab(self.disp_graph_widget, "Offsets")
 
         self.main_content_layout.addWidget(self.results_tabs)
 
@@ -458,92 +467,6 @@ class MainWindow(QWidget):
         map_window.show()
         self.open_windows.append(map_window)
         map_window.destroyed.connect(lambda: self.open_windows.remove(map_window))
-
-    
-
-    def open_fitting_window(self):
-
-        fitting_window = QMainWindow()
-        fitting_window.setWindowTitle("Adjust Parameters")
-        fitting_window.resize(1400, 1200)
-
-        splitter = QSplitter(Qt.Horizontal, fitting_window)
-        fitting_window.setCentralWidget(splitter)
-
-        slider_panel = QWidget()
-        slider_layout = QVBoxLayout()
-        slider_panel.setLayout(slider_layout)
-        splitter.addWidget(slider_panel)
-
-        fig_disp = Figure(figsize=(6, 4))
-        canvas = FigureCanvas(fig_disp)
-        ax = fig_disp.add_subplot(111)
-        splitter.addWidget(canvas)
-        splitter.setSizes([3,2])
-
-        x_tensor = torch.tensor(self.x_data, dtype=float).unsqueeze(0).T
-
-        self.prof_fig.canvas.draw()
-        w, h = self.prof_fig.canvas.get_width_height()
-        buf = np.frombuffer(self.prof_fig.canvas.buffer_rgba(), dtype=np.uint8)
-        buf = buf.reshape(h, w, 4)[:, :, :3]
-        #h, w, _ = buf.shape
-
-        bckgnd = buf[:, w//2:, :]
-
-
-        def update_figure():
-            ax.clear()
-
-            ax.imshow(bckgnd, aspect='auto', 
-                      extent=[min(self.x_data), max(self.x_data), min(self.x_data), max(self.x_data)], 
-                      alpha=0.5)
-
-            y_pred = self.model(x_tensor).detach().numpy()
-
-            ax.plot(self.x_data, y_pred, color="steelblue", label="Model output")
-            ax.legend()
-            ax.set_title("Interactive Model Fit")
-            ax.grid(True)
-            canvas.draw_idle()
-
-        def update_model(name, label, slider_val):
-            new_value = slider_val / 10.0
-            label.setText(f"{name}: {new_value:.2f}")
-
-            with torch.no_grad():
-                for n, p in self.model.named_parameters():
-                    if n == name:
-                        p.copy_(torch.tensor(new_value))
-                        break
-
-            update_figure()
-
-        for name, param in self.model.named_parameters():
-
-            init_val = float(param.item())
-
-            label = QLabel(f'{name}: {init_val:.2f}')
-            slider = QSlider(Qt.Horizontal)
-            slider.setRange(-100, 100)
-            slider.setValue(int(init_val * 10))
-
-            slider.valueChanged.connect(
-                lambda val, n=name, l=label: update_model(n, l, val)
-            )
-
-            slider_layout.addWidget(label)
-            slider_layout.addWidget(slider)
-
-            setattr(self, f"{name}_slider", slider)
-            setattr(self, f"{name}_label", label)
-
-        update_figure()
-
-        fitting_window.show()
-
-        self.open_windows.append(fitting_window)
-        fitting_window.destroyed.connect(lambda: self.open_windows.remove(fitting_window))
     
 
     def create_proc_panel_widgets(self):
@@ -1070,17 +993,76 @@ class MainWindow(QWidget):
         return run
 
 
+    # def set_active_run(self, run):
+    #     self.active_run = run
+
+    #     if hasattr(self, "selector_model"):
+    #         self.refresh_file_selector_after_result()
+
+    #     if hasattr(self, "loss_graph_widget"):
+    #         self.loss_graph_widget.refresh(rebuild_tree=True)
+
+    #     if hasattr(self, "disp_graph_widget"):
+    #         self.disp_graph_widget.refresh(rebuild_tree=True)
+
+
     def set_active_run(self, run):
         self.active_run = run
-
-        if hasattr(self, "selector_model"):
-            self.refresh_file_selector_after_result()
 
         if hasattr(self, "loss_graph_widget"):
             self.loss_graph_widget.refresh(rebuild_tree=True)
 
         if hasattr(self, "disp_graph_widget"):
             self.disp_graph_widget.refresh(rebuild_tree=True)
+
+        self.restore_run_profile_state(run)
+
+
+    def restore_run_profile_state(self, run):
+        if run is None:
+            return
+
+        mode = run.selector_mode
+
+        if mode == "result":
+            file_idx = run.last_file_idx
+            profile_idx = run.last_profile_idx
+
+            if self.is_valid_completed_profile(run, file_idx, profile_idx):
+                self.display_profile(file_idx, profile_idx)
+            elif self.is_valid_file_index(run, file_idx):
+                self.show_profile_selector(file_idx)
+            else:
+                self.show_file_selector()
+
+        elif mode == "profiles":
+            file_idx = run.current_file_idx
+
+            if self.is_valid_file_index(run, file_idx):
+                self.show_profile_selector(file_idx)
+            else:
+                self.show_file_selector()
+
+        else:
+            self.show_file_selector()
+
+        if hasattr(self, "results_tabs"):
+            self.results_tabs.setCurrentWidget(self.profile_screen_split)
+
+
+    def is_valid_file_index(self, run, file_idx):
+        return file_idx is not None and 0 <= file_idx < len(run.file_list)
+
+
+    def is_valid_completed_profile(self, run, file_idx, profile_idx):
+        if not self.is_valid_file_index(run, file_idx):
+            return False
+
+        return (
+            profile_idx is not None
+            and 0 <= profile_idx < len(run.file_list[file_idx])
+            and run.file_list[file_idx][profile_idx] is not None
+        )
 
 
     def process(self):
@@ -1353,7 +1335,7 @@ class MainWindow(QWidget):
 
             # Single Profile in File
             if prof_id == "None":
-                run.loss_x_vals[0].append(file_name)
+                run.loss_x_vals[0].append(file_num)
                 coords = self.process_locations(df.iloc[0], i) if self.loc_format else None
                 jobs.append({'df': str(file),
                              'file_num': file_name, 
@@ -1373,7 +1355,7 @@ class MainWindow(QWidget):
 
                 for id_idx in range(num_ids):
                     curr_prof_id = profile_ids[id_idx]
-                    run.loss_x_vals[-1].append("Profile " + str(curr_prof_id))
+                    run.loss_x_vals[-1].append(str(curr_prof_id))
                     orig_prof = profiles.get_group(curr_prof_id)
                     coords = self.process_locations(orig_prof.iloc[0], curr_prof_id) if self.loc_format else None
                     jobs.append({'df': str(file), 
@@ -1458,21 +1440,21 @@ class MainWindow(QWidget):
             file_name = file_names[curr_file_i]
 
             run.file_list.append(len(keys)*[None])
-            # run.disp_graph_vals = [[] for _ in range(len(groups))]
-            # run.disp_graph_vals.append(len(keys)*[None])
+            run.disp_graph_vals.append(len(keys)*[None])
             run.loss_graph_vals.append(len(keys)*[None])
             run.completed_vals.append(0)
             profile_list_idx = 0
             for k in keys:
                 key = prof_keys[k]
-                print("KEY ", key, key[key.rfind("_") + 1:])
+                key_num = key[key.rfind("_") + 1:]
+                print("KEY ", key, key_num)
 
-                run.loss_x_vals[-1].append(key)
+                run.loss_x_vals[-1].append(key_num)
                 
                 coords = self.process_locations(None, k) if self.loc_format else None
                 jobs.append({'df_path': f_path,
                              'prof_key': key,
-                             'file_num': key[key.rfind("_") + 1:], # profile_id format: profile_num
+                             'file_num': key_num, # profile_id format: profile_num
                              'coords': coords, 
                              'file_key': (file_name, profile_list_idx, curr_file_i),
                              'file_info': (f_path, k)})
@@ -1692,10 +1674,6 @@ class MainWindow(QWidget):
         self.worker = None
         self.thread = None
 
-        # self.pause_btn.setEnabled(False)
-        # self.resume_btn.setEnabled(False)
-        # self.cancel_btn.setEnabled(False)
-
         self.pause_btn.setParent(None)
         self.resume_btn.setParent(None)
         self.cancel_btn.setParent(None)
@@ -1706,12 +1684,12 @@ class MainWindow(QWidget):
         if self.active_run is run:
             self.progress_bar.setValue(completed)
 
-
     def on_profile_result_ready_for_run(self, run, r):
         _, prof_idx, file_idx = r["file_key"]
 
         run.file_list[file_idx][prof_idx] = r
         run.loss_graph_vals[file_idx][prof_idx] = r["final_loss"]
+        run.disp_graph_vals[file_idx][prof_idx] = extract_disp_by_dim(r['table'])
         run.completed_vals[file_idx] += 1
         nav_key = (file_idx, prof_idx)
 
@@ -1722,10 +1700,10 @@ class MainWindow(QWidget):
         # Only refresh visible GUI if the run being updated is currently displayed.
         if self.active_run is run:
             if hasattr(self, "loss_graph_widget"):
-                self.loss_graph_widget.refresh(rebuild_tree=False)
+                self.loss_graph_widget.refresh(rebuild_tree=False, result=r)
 
             if hasattr(self, "disp_graph_widget"):
-                self.disp_graph_widget.refresh(rebuild_tree=False)
+                self.disp_graph_widget.refresh(rebuild_tree=False, result=r)
 
             if not run.selector_view_initialized:
                 self.show_file_selector_first_run()
@@ -1772,58 +1750,6 @@ class MainWindow(QWidget):
             if hasattr(self, "selector_model") and hasattr(self, "main_stack"):
                 self.refresh_file_selector_after_result()
 
-            if hasattr(self, "losses_tab") and self.losses_tab is not None:
-                self.build_losses_tab()
-
-
-    def refresh_losses_tab_after_result(self):
-        if not hasattr(self, "results_tabs") or self.results_tabs is None:
-            return
-
-        if self.results_tabs.currentWidget() != self.losses_tab:
-            return
-
-        # Do not rebuild the whole tab.
-        # Just update labels/check states if needed and redraw the plot.
-        if hasattr(self, "loss_tree"):
-            self.refresh_loss_tree_labels_only()
-
-        self.update_loss_plot_from_tree()
-
-    def refresh_loss_tree_labels_only(self):
-        run = self.active_run
-        if run is None or not hasattr(self, "loss_tree"):
-            return
-
-        self.updating_loss_tree = True
-
-        for i in range(self.loss_tree.topLevelItemCount()):
-            parent = self.loss_tree.topLevelItem(i)
-            data = parent.data(0, Qt.UserRole)
-
-            if not data:
-                continue
-
-            file_idx = data["file_idx"]
-            file_name = self.get_file_display_name_for_loss(file_idx)
-            #completed = self.count_completed_losses_for_file(run, file_idx)
-            completed = run.completed_vals[file_idx]
-            total = len(run.loss_graph_vals[file_idx])
-
-            parent.setText(0, f"{file_name}  ({completed}/{total} complete)")
-
-            for profile_idx in range(parent.childCount()):
-                child = parent.child(profile_idx)
-                label = self.get_profile_label_for_loss(run, file_idx, profile_idx)
-
-                if run.loss_graph_vals[file_idx][profile_idx] is None:
-                    label += "  Processing..."
-
-                child.setText(0, label)
-
-            self.update_parent_check_state(parent, file_idx)
-
-        self.updating_loss_tree = False
 
     def refresh_file_selector_after_result(self, r=None):
         """
@@ -1842,7 +1768,7 @@ class MainWindow(QWidget):
         # if not hasattr(self, "main_stack"):
         #     return
 
-        view_state = getattr(self, "selector_mode", "files")
+        view_state = self.active_run.selector_mode
 
         if r is not None:
             _, _, finished_file_idx = r["file_key"]
@@ -1853,6 +1779,7 @@ class MainWindow(QWidget):
         if view_state == "files":
             self.selector_model.set_items(
                 self.active_run.file_list,
+                self.active_run.file_names,
                 self.active_run.completed_vals,
                 mode="files"
             )
@@ -1944,9 +1871,6 @@ class MainWindow(QWidget):
 
         self.selector_view.clicked.connect(self.on_selector_row_clicked)
 
-        self.selector_mode = "files"
-        self.current_file_idx = None
-
     
     def show_file_selector_first_run(self):
         self.clear_layout_detach(self.processing_panel)
@@ -1974,7 +1898,11 @@ class MainWindow(QWidget):
 
 
     def show_file_selector(self):
-        if self.selector_mode == "profiles":
+        run = self.active_run
+        if run is None:
+            return
+
+        if run.selector_mode == "profiles":
             self.proc_panel_title.setText("SELECT FILE/FOLDER")
         else:
             self.clear_layout_detach(self.processing_panel)
@@ -1984,19 +1912,17 @@ class MainWindow(QWidget):
             self.processing_panel.addStretch()
             self.proc_panel_title.setText("SELECT FILE/FOLDER")
 
-        self.selector_mode = "files"
-        self.current_file_idx = None
-
-        if self.active_run is None:
-            return
+        run.selector_mode = "files"
+        run.current_file_idx = None
 
         self.selector_model.current_file_idx = None
-        self.selector_model.high_loss_files = self.active_run.high_loss_files
-        self.selector_model.high_loss_profiles = self.active_run.high_loss_profiles
+        self.selector_model.high_loss_files = run.high_loss_files
+        self.selector_model.high_loss_profiles = run.high_loss_profiles
 
         self.selector_model.set_items(
-            self.active_run.file_list,
-            self.active_run.completed_vals,
+            items=run.file_list,
+            file_names=run.file_names,
+            completed=run.completed_vals,
             mode="files"
         )
 
@@ -2004,49 +1930,52 @@ class MainWindow(QWidget):
         self.selector_view.show()
 
     def on_selector_row_clicked(self, index):
+        run = self.active_run
+        if run is None:
+            return
+
         row = index.row()
 
-        if self.selector_mode == "files":
-            file_idx = row
-            file_item = self.active_run.file_list[file_idx]
+        if run.selector_mode == "files":
+            file_item = self.active_run.file_list[row]
 
-            if file_item is None:
+            if file_item is None or not 0 <= row < len(run.file_list):
                 return
 
-            self.show_profile_selector(file_idx)
+            self.show_profile_selector(row)
 
-            # if isinstance(file_item, list):
-            #     self.show_profile_selector(file_idx)
-            # else:
-            #     self.display_profile(file_idx, None)
+        elif run.selector_mode == "profiles":
+            file_idx = run.current_file_idx
 
-        elif self.selector_mode == "profiles":
-            profile_idx = row
-            file_idx = self.current_file_idx
-
-            if self.active_run.file_list[file_idx][profile_idx] is None:
+            if not self.is_valid_completed_profile(run, file_idx, row):
                 return
 
-            self.display_profile(file_idx, profile_idx)
+            self.display_profile(file_idx, row)
 
 
     def show_profile_selector(self, file_idx):
-        if self.selector_mode == "result":
+        run = self.active_run
+        if run is None:
+            return
+
+        if file_idx is None or not 0 <= file_idx < len(run.file_list):
+            self.show_file_selector()
+            return
+
+        if run.selector_mode == "result":
             self.clear_layout_detach(self.processing_panel)
             self.processing_panel.addWidget(self.proc_panel_title)
             self.processing_panel.addWidget(self.title_line)
             self.processing_panel.setAlignment(Qt.AlignTop)
             self.processing_panel.addStretch()
-            self.proc_panel_title.setText("SELECT PROFILE")
-        elif self.selector_mode == "files":
-            self.proc_panel_title.setText("SELECT PROFILE")
+        self.proc_panel_title.setText("SELECT PROFILE")
 
-        self.selector_mode = "profiles"
-        self.current_file_idx = file_idx
+        run.selector_mode = "profiles"
+        run.current_file_idx = file_idx
 
         self.selector_model.current_file_idx = file_idx
-        self.selector_model.high_loss_files = self.active_run.high_loss_files
-        self.selector_model.high_loss_profiles = self.active_run.high_loss_profiles
+        self.selector_model.high_loss_files = run.high_loss_files
+        self.selector_model.high_loss_profiles = run.high_loss_profiles
 
         self.selector_model.set_items(
             self.active_run.file_list[file_idx],
@@ -2064,19 +1993,16 @@ class MainWindow(QWidget):
 
 
     def on_back_clicked(self):
+        file_idx = self.active_run.last_file_idx
 
-        # Restore processing side panel title
-        #self.clear_layout_detach(self.processing_panel)
-
-        # Decide which selector to show
-        if hasattr(self, "last_file_idx") and self.last_profile_idx is not None:
-            self.show_profile_selector(self.last_file_idx)
+        if file_idx is not None and 0 <= file_idx < len(self.active_run.file_list):
+            self.show_profile_selector(file_idx)
         else:
             self.show_file_selector()
 
         # Force the visible page
-        self.main_stack.setCurrentWidget(self.selector_page)
-        self.selector_view.show()
+        # self.main_stack.setCurrentWidget(self.selector_page)
+        # self.selector_view.show()
 
 
     def get_adjacent_profile_position(self, file_index, profile_index, direction):
@@ -2109,9 +2035,16 @@ class MainWindow(QWidget):
     
 
     def go_to_adjacent_profile(self, direction):
+        run = self.active_run
+        if run is None:
+            return
+
+        if run.last_file_idx is None or run.last_profile_idx is None:
+            return
+
         pos = self.get_adjacent_profile_position(
-            self.last_file_idx,
-            self.last_profile_idx,
+            run.last_file_idx,
+            run.last_profile_idx,
             direction
         )
 
@@ -2123,14 +2056,27 @@ class MainWindow(QWidget):
 
 
     def display_profile(self, file_index, profile_index):
-        self.last_file_idx = file_index
-        self.last_profile_idx = profile_index
-        self.selector_mode = "result"
+        run = self.active_run
+        if run is None:
+            return
+
+        if file_index is None or not 0 <= file_index < len(run.file_list):
+            self.show_file_selector()
+            return
+
+        if profile_index is None or not 0 <= profile_index < len(run.file_list[file_index]):
+            self.show_profile_selector(file_index)
+            return
+
+        run.last_file_idx = file_index
+        run.last_profile_idx = profile_index
+        run.current_file_idx = file_index
+        run.selector_mode = "result"
 
         self.clear_layout_delete(self.profile_page_layout)
         self.clear_layout_detach(self.processing_panel)
 
-        table, tabs, hist_button = self.build_profile_view(file_index, profile_index, flag=True)
+        table, tabs = self.build_profile_view(file_index, profile_index)
 
         #self.main_area_layout.addWidget(tabs)
         self.profile_page_layout.addWidget(tabs)
@@ -2139,7 +2085,6 @@ class MainWindow(QWidget):
         self.processing_panel.addWidget(self.proc_panel_title)
         self.processing_panel.addWidget(self.title_line)
         self.processing_panel.addWidget(table)
-        self.processing_panel.addWidget(hist_button)
 
         nav_layout = QHBoxLayout()
 
@@ -2175,14 +2120,10 @@ class MainWindow(QWidget):
         self.main_stack.setCurrentWidget(self.profile_page)
 
 
-    def build_profile_view(self, file_index, profile_index, flag=False):
+    def build_profile_view(self, file_index, profile_index):
         profile = self.active_run.file_list[file_index][profile_index]
 
         fig_path, df, u, fig_loss_path = profile['fig'], profile['table'], profile['uncert'], profile['losses']
-        file_info = profile['file_info']
-
-        # if flag:
-        #     self.prof_fig = fig
 
         tabs = QTabWidget()
 
@@ -2227,10 +2168,7 @@ class MainWindow(QWidget):
         table.resizeColumnsToContents()
         table.resizeRowsToContents()
 
-        plot_history_button = QPushButton("Show Fit History")
-        plot_history_button.clicked.connect(lambda: self.show_fit_history(tabs, file_info))
-
-        return table, tabs, plot_history_button
+        return table, tabs
         
     def show_profile_in_popup(self, file_index, profile_index):
         profile_window = QMainWindow()
