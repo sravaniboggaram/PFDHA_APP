@@ -213,56 +213,18 @@ def L1(y_pred, y_act):
     #return torch.mean(torch.abs(y_pred - y_act)).detach().numpy()
     return torch.mean(torch.abs(y_pred - y_act))
 
-def regional_weighted_loss(y_pred, y_act, loc_params, width_params, scale):
-    temp_loc = [float(p.detach()) for p in loc_params]
-    temp_width = [float(p.detach()) for p in width_params]
 
-    lin_seg, sig_seg, _ = split_profile(temp_loc, temp_width, scale=scale)
-    # if j % 300 == 0:
-    #     plt.plot(np.linspace(0, len(y_pred), len(y_pred.detach().numpy())), y_pred.detach().numpy())
-    #     plt.plot(np.linspace(0, len(y_act), len(y_act.detach().numpy())), y_act.detach().numpy())
-    #     plt.axvline(x=sig_seg[0][0], color='r')
-    #     plt.axvline(x=sig_seg[0][1], color='r')
-    #     plt.show()
+# def loc_loss(y_pred, y_act, loc_params):
+#     if len(loc_params) == 1:
+#         return torch.nn.MSELoss()(y_pred, y_act)
 
-    loss = torch.tensor(0.0)
-    w_lin = 10.0
-    w_sig = 1.0
-
-    for i in range(len(sig_seg)):
-        s1, e1, s2, e2 = lin_seg[i][0], lin_seg[i][1], sig_seg[i][0], sig_seg[i][1]
-        lin_diff = (y_pred[s1:e1] - y_act[s1:e1])**2
-        sig_diff = torch.abs(y_pred[s2:e2] - y_act[s2:e2])
-        loss += w_lin*torch.sum(lin_diff) + w_sig*torch.sum(sig_diff)
-
-    loss += w_lin*torch.sum(((y_pred[lin_seg[-1][0]: lin_seg[-1][1]] - y_act[lin_seg[-1][0]: lin_seg[-1][1]])**2))
-
-    return loss
-
-
-def penalty_loss_old(y_pred, y_act, locs=[1], lam=10):
-    return torch.nn.MSELoss(reduction='sum')(y_pred, y_act)
-    # if len(locs) == 1:
-    #     return torch.nn.MSELoss(reduction='sum')(y_pred, y_act)
-    # p = torch.tensor(0)
-    # for l in range(1, len(locs)):
-    #     p = torch.add(p, torch.tensor(locs[l].item() - locs[l-1].item()))
-    # p = torch.subtract(p, torch.tensor(0.5*len(locs)-1))
-    # mse = torch.nn.MSELoss(reduction='sum') 
-    # return torch.subtract(mse(y_pred, y_act), lam*p)
-
-
-def loc_loss(y_pred, y_act, loc_params):
-    if len(loc_params) == 1:
-        return torch.nn.MSELoss()(y_pred, y_act)
-
-    loc_penalty = torch.tensor(1, dtype=torch.float32)
-    for i in range(1, len(loc_params)):
-        loc_penalty = torch.add(loc_penalty,
-                                (loc_params[i] - loc_params[i-1]) - torch.tensor(0.1, dtype=torch.float32),
-                                alpha=3)
+#     loc_penalty = torch.tensor(1, dtype=torch.float32)
+#     for i in range(1, len(loc_params)):
+#         loc_penalty = torch.add(loc_penalty,
+#                                 (loc_params[i] - loc_params[i-1]) - torch.tensor(0.1, dtype=torch.float32),
+#                                 alpha=3)
     
-    return torch.subtract(torch.nn.MSELoss()(y_pred, y_act), loc_penalty)
+#     return torch.subtract(torch.nn.MSELoss()(y_pred, y_act), loc_penalty)
 
 def param_act_to_transf(param, bounds):
     transf_p = (param - bounds[0]) / (bounds[1] - bounds[0])
@@ -318,10 +280,19 @@ def NN_optimize(data, collect_param_vals=False):
 
     prev_loss = loss_fn(y_pred, y_b).item()
     losses['total_loss'].append(prev_loss)
+
+    total = 0
         
-    def training_loop(ratio_limit, iter_limit, vars, prev_loss, lr=1e-3, lf=None):
+    def training_loop(ratio_limit, iter_limit, vars, lr=1e-3):
         opt.param_groups[0]['lr'] = lr
         set_trainable(model.named_parameters(), vars)
+
+        y_pred = model(x_tensor)
+        
+        if data.n_dim > 1:
+            y_pred = torch.concat((y_pred[:,0], y_pred[:,1]))
+                
+        prev_loss = loss_fn(y_pred, y_b)
 
         opt.zero_grad()
         ratio = 0.0
@@ -337,7 +308,7 @@ def NN_optimize(data, collect_param_vals=False):
             if data.n_dim > 1:
                 y_pred = torch.concat((y_pred[:,0], y_pred[:,1]))
                     
-            loss = loss_fn(y_pred, y_b) if lf == "L1" else loss_fn(y_pred, y_b)
+            loss = loss_fn(y_pred, y_b)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -355,48 +326,24 @@ def NN_optimize(data, collect_param_vals=False):
                 # print("ITER_N", iter_n)
                 break
         
-        return {'mse': rmse(y_pred, y_b).item(),
-                #"regional": regional_weighted_loss(y_pred, y_b, loc_p, width_p, scale).item(),
-                'L1': L1(y_pred, y_b).item()}
-        #total_n_epochs += iter_n
+        return iter_n
 
-    l = training_loop(0.99, 20000, ["all_true"], prev_loss)
-    prev_loss = l['mse']
+    n = training_loop(0.999, 20000, ["all_true"])
+
+    total += n
 
     loss_fn = torch.nn.L1Loss()
-    l = training_loop(0.999, 4000, ["loc", "width"], prev_loss, lr=1e-4, lf="L1")
-    prev_loss = l['mse']
+    n = training_loop(0.999, 4000, ["loc", "width"], lr=1e-4)
+
+    total += n
 
     loss_fn = torch.nn.MSELoss()
-    training_loop(0.9999, 3000, ["ramp", "slope", "origin", "disp"], prev_loss, lr=1e-4,lf="L1")
+    n = training_loop(0.9999, 4000, ["ramp", "slope", "origin", "disp"], lr=1e-4)
 
-    # fig, ax = plt.subplots(nrows=2, ncols=1)
-    # ax[0].plot(x, y)
-    # ax[0].plot(x, model(x_tensor).detach().numpy())
-
-    # lin_seg, _, _ = split_profile([param_transf_to_act(l.item(), data.param_bounds['loc']) for l in loc_p],
-    #                               [param_transf_to_act(w.item(), data.param_bounds['width']) for w in width_p],
-    #                               scale)
-    # ax[0].axvline(x=lin_seg[0][1])
-    # ax[0].axvline(x=lin_seg[1][0])
-    # plt.show()
-
-    # for name, p in model.named_parameters():
-    #     #print(name, p)
-    #     if "d0.ramp" in name:
-    #         ramp = stats.linregress(x[lin_seg[0][0]:lin_seg[0][1]].flatten(), y[:,0][lin_seg[0][0]:lin_seg[0][1]].flatten())
-    #         ramp_slope, _ = ramp.slope, ramp.intercept
-    #         p.data *= 0
-    #         p.data += torch.tensor(param_act_to_transf(ramp_slope, data.param_bounds['ramp']), dtype=torch.float32)
-    #     elif "d1.ramp" in name:
-    #         ramp = stats.linregress(x[lin_seg[0][0]:lin_seg[0][1]].flatten(), y[:,1][lin_seg[0][0]:lin_seg[0][1]].flatten())
-    #         ramp_slope, _ = ramp.slope, ramp.intercept
-    #         p.data *= 0
-    #         p.data += torch.tensor(ramp_slope, dtype=torch.float32)
-
-    # l = training_loop(0.9999, 5000, ["disp"], prev_loss, lr=1e-4)
+    total += n
     
-    # for name, p in model.named_parameters():
+    for name, p in model.named_parameters():
+        print(name, p)
     #     var_name = name[name.rfind(".")+1:]
     #     low, high = data.param_bounds[var_name]
     #     sig = torch.sigmoid(p).item()
@@ -409,8 +356,8 @@ def NN_optimize(data, collect_param_vals=False):
     #     print("SIG :", sig)
     #     print("OUT :", bounded.item())
 
-    print("OPTIMIZER LOSS: ", losses['total_loss'][-1])
+    # print("OPTIMIZER LOSS: ", losses['total_loss'][-1])
 
-    print("Done! Profile "+str(data.prof_id))
+    # print("Done! Profile "+str(data.prof_id))
 
-    return model, losses
+    return model, losses, total
